@@ -119,12 +119,19 @@ class TextBoxElement extends CanvasElement {
     required this.text,
     required this.color,
     required this.fontSize,
+    this.fontFamily,
   });
 
   Rect rect;
   String text;
   Color color;
   double fontSize;
+
+  /// A Google Fonts family name (e.g. "Tinos"), or null for the app's
+  /// default font. Kept as a plain family-name string rather than an
+  /// enum so new choices can be added in one place (see kTextFontChoices
+  /// in canvas_tools.dart) without touching the saved-file format.
+  String? fontFamily;
 
   @override
   Rect get bounds => rect;
@@ -138,6 +145,7 @@ class TextBoxElement extends CanvasElement {
         'text': text,
         'color': color.toARGB32(),
         'fontSize': fontSize,
+        if (fontFamily != null) 'fontFamily': fontFamily,
       };
 
   static TextBoxElement fromJson(Map<String, dynamic> json) {
@@ -154,6 +162,7 @@ class TextBoxElement extends CanvasElement {
       text: json['text'] as String,
       color: Color(json['color'] as int),
       fontSize: (json['fontSize'] as num).toDouble(),
+      fontFamily: json['fontFamily'] as String?,
     );
   }
 }

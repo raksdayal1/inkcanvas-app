@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:google_fonts/google_fonts.dart';
 
 import '../models/canvas_element.dart';
 import 'canvas_painter.dart';
@@ -21,25 +23,40 @@ import 'page_edit_controller.dart';
 /// - Touch (finger): one finger pans, two-or-more fingers pinch-pan-zoom —
 ///   always, regardless of tool — *except* when the Select tool is active,
 ///   where one finger taps/drags to select and move content (a second
-///   finger arriving mid-gesture still takes over as pinch-zoom).
-/// - Mouse: primary-button drag performs the active tool's action; middle-
-///   or right-button drag pans; the scroll wheel zooms (holding Ctrl) or
-///   pans (plain scroll).
+///   finger arriving mid-gesture still takes over as pinch-zoom), *and*
+///   except that a finger held still on an image starts a long-press
+///   timer (see [_longPressTimer]) that pops up a Cut/Copy/Delete menu
+///   underneath it.
+/// - Mouse: primary-button drag performs the active tool's action;
+///   middle-button drag pans; the scroll wheel zooms (holding Ctrl) or
+///   pans (plain scroll); right-click opens a context menu (Paste on
+///   empty canvas, or Cut/Copy/Delete on an image) instead of panning or
+///   drawing.
 class InfiniteCanvas extends StatefulWidget {
   const InfiniteCanvas({
     super.key,
     required this.editController,
     required this.viewController,
+    this.onRequestPasteAt,
   });
 
   final PageEditController editController;
   final CanvasViewController viewController;
 
+  /// Called with a canvas-space point when the user picks "Paste" from
+  /// the right-click context menu on empty canvas. Handling paste here
+  /// (rather than inside this widget) is what lets it fall back to
+  /// reading the OS clipboard - that needs the same file-import/
+  /// aspect-ratio-decoding machinery [PageScreen] already has for the
+  /// file-picker/Ctrl+V paths, which this widget has no reason to
+  /// duplicate.
+  final void Function(Offset canvasPoint)? onRequestPasteAt;
+
   @override
   State<InfiniteCanvas> createState() => _InfiniteCanvasState();
 }
 
-enum _GestureMode { none, draw, erase, shape, lasso, select, resize, pan, textPending }
+enum _GestureMode { none, draw, erase, shape, lasso, select, resize, pan, textPending, contextMenuPending }
 
 class _InfiniteCanvasState extends State<InfiniteCanvas> {
   _GestureMode _mode = _GestureMode.none;
@@ -77,8 +94,20 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
   /// hover.
   Offset? _hoverLocal;
 
+  /// Armed by a touch pointer landing on an image (see [_onPointerDown]),
+  /// and fired after [_longPressDuration] if that finger is still down
+  /// and hasn't moved - see [_fireLongPress]. Cancelled by any move past
+  /// [_longPressMoveTolerance], a second finger joining, or lifting the
+  /// finger first (a plain tap/select, handled normally).
+  Timer? _longPressTimer;
+  String? _longPressElementId;
+  Offset? _longPressDownLocal;
+  static const _longPressDuration = Duration(milliseconds: 500);
+  static const _longPressMoveTolerance = 12.0;
+
   @override
   void dispose() {
+    _longPressTimer?.cancel();
     for (final c in _textControllers.values) {
       c.dispose();
     }
@@ -165,16 +194,26 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
   /// single-short-line box still keeps a comfortable minimum size to tap.
   static const double _minTextBoxHeight = 32.0;
 
+  /// The style a text box's [fontFamily]/[fontSize]/[color] renders
+  /// with - routed through google_fonts for any non-null family (see
+  /// kTextFontChoices) so the same font actually looks the same on
+  /// Windows and Android, rather than depending on what's installed on
+  /// the OS; null falls back to the app's plain default TextStyle.
+  TextStyle _fontStyle({required String? fontFamily, required double fontSize, Color? color}) {
+    if (fontFamily == null) return TextStyle(fontSize: fontSize, color: color);
+    return GoogleFonts.getFont(fontFamily, fontSize: fontSize, color: color);
+  }
+
   /// Measures the canvas-space height needed to fit [text] inside a text
-  /// box of the given [canvasWidth] and [fontSize], accounting for the
-  /// TextField's 4px content padding on each side (see the TextField's
-  /// `contentPadding` in _buildOverlayWidgets). Never returns less than
-  /// [_minTextBoxHeight].
-  double _measureTextBoxHeight(String text, double canvasWidth, double fontSize) {
+  /// box of the given [canvasWidth]/[fontSize]/[fontFamily], accounting
+  /// for the TextField's 4px content padding on each side (see the
+  /// TextField's `contentPadding` in _buildOverlayWidgets). Never returns
+  /// less than [_minTextBoxHeight].
+  double _measureTextBoxHeight(String text, double canvasWidth, double fontSize, String? fontFamily) {
     const horizontalPadding = 8.0; // 4px left + 4px right
     const verticalPadding = 8.0; // 4px top + 4px bottom
     final painter = TextPainter(
-      text: TextSpan(text: text.isEmpty ? ' ' : text, style: TextStyle(fontSize: fontSize)),
+      text: TextSpan(text: text.isEmpty ? ' ' : text, style: _fontStyle(fontFamily: fontFamily, fontSize: fontSize)),
       textDirection: TextDirection.ltr,
     )..layout(maxWidth: (canvasWidth - horizontalPadding).clamp(1.0, double.infinity));
     return (painter.height + verticalPadding).clamp(_minTextBoxHeight, double.infinity);
@@ -207,7 +246,7 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
           // OneNote-style. This mutates the model directly (skipping the
           // undo stack) since it's a passive visual follow-of-content, not
           // a discrete user edit.
-          final neededHeight = _measureTextBoxHeight(controller.text, t.rect.width, t.fontSize);
+          final neededHeight = _measureTextBoxHeight(controller.text, t.rect.width, t.fontSize, t.fontFamily);
           if ((t.rect.height - neededHeight).abs() > 0.5) {
             t.rect = Rect.fromLTWH(t.rect.left, t.rect.top, t.rect.width, neededHeight);
           }
@@ -215,7 +254,14 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
           final focusNode = _textFocusNodes.putIfAbsent(t.id, () {
             final node = FocusNode();
             node.addListener(() {
-              if (!node.hasFocus) {
+              if (node.hasFocus) {
+                // Selecting the box being typed into (not just focusing
+                // it) is what lets the font family/size controls - which
+                // act on whatever's selected - actually reach it. It's
+                // cleared again the moment editing ends, below, by the
+                // switch back to the Pen tool.
+                widget.editController.selectOnly(t.id);
+              } else {
                 widget.editController.commitTextEdit(t.id, controller.text);
                 // Tapped to place a box, then dismissed the keyboard
                 // without typing anything (or deleted everything you'd
@@ -225,6 +271,7 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
                 // so the very next stylus touch draws instead of needing
                 // a trip back to the toolbar - you only get a new text
                 // box when you deliberately pick the Text tool again.
+                // (This is also what clears the selection set above.)
                 if (widget.editController.tool == CanvasTool.text) {
                   widget.editController.setTool(CanvasTool.pen);
                 }
@@ -274,7 +321,11 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
                       focusNode: focusNode,
                       autofocus: _autofocusTextId == t.id,
                       maxLines: null,
-                      style: TextStyle(fontSize: t.fontSize * viewport.scale, color: t.color),
+                      style: _fontStyle(
+                        fontFamily: t.fontFamily,
+                        fontSize: t.fontSize * viewport.scale,
+                        color: t.color,
+                      ),
                       decoration: const InputDecoration(
                         isCollapsed: true,
                         border: InputBorder.none,
@@ -324,7 +375,24 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
         final tool = widget.editController.tool;
         if (tool == CanvasTool.select) {
           _primaryPointerId = event.pointer;
-          _beginSelectGesture(viewport.screenToCanvas(local), local);
+          final hitId = _beginSelectGesture(viewport.screenToCanvas(local), local);
+          if (hitId != null && _isImageElement(hitId)) {
+            _armLongPress(hitId, local);
+          }
+        } else if (tool == CanvasTool.lasso) {
+          // Previously fell through to the generic "pan" branch below,
+          // so a single finger with the Lasso tool active just panned
+          // the canvas instead of lassoing anything - touch never
+          // actually drew a lasso before this. _beginLassoToolGesture
+          // also covers the "drag an already-selected item" case (a
+          // press landing on something a prior lasso selected moves the
+          // whole selection instead of starting a new lasso on top of
+          // it), same as the mouse/stylus path.
+          _primaryPointerId = event.pointer;
+          final hitId = _beginLassoToolGesture(viewport.screenToCanvas(local), local);
+          if (hitId != null && _isImageElement(hitId)) {
+            _armLongPress(hitId, local);
+          }
         } else if (tool == CanvasTool.text) {
           // Single-finger tap places a text box too (not just stylus/mouse),
           // since a touch-only tablet has no other way to add one. But if
@@ -347,14 +415,36 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
           // this is scoped to certain tools.
           _primaryPointerId = event.pointer;
           _downLocal = local; // needed to tell a tap from a drag on pointer-up
+          // Also arm the long-press menu here, not just under the Select
+          // tool - Pen/Highlighter are what most people actually have
+          // active most of the time, and a long-press on an image should
+          // bring up Cut/Copy/Delete no matter which of these it finds
+          // active, same as the tap-to-grab shortcut just above already
+          // works regardless of tool.
+          final grabbedId = _borderGrabTapCandidateId;
+          if (grabbedId != null && _isImageElement(grabbedId)) {
+            _armLongPress(grabbedId, local);
+          }
         } else {
           _mode = _GestureMode.pan;
           _lastFocal = local;
           _lastSpan = null;
         }
       } else {
+        // A second finger joining mid-gesture always takes over as
+        // pinch-zoom, even if the first finger was mid-long-press on an
+        // image - cancel that timer so it can't still fire afterward.
+        _cancelLongPress();
         if (_mode == _GestureMode.select) {
           _finishSelectGesture();
+          _primaryPointerId = null;
+        } else if (_mode == _GestureMode.lasso) {
+          // A second finger landing mid-lasso-drag hands off to
+          // pinch/pan below - end the in-progress lasso first so its
+          // draft outline doesn't linger (it'll have too few points to
+          // select anything, per endLasso's own minimum, so this is
+          // effectively just a clean cancel).
+          widget.editController.endLasso();
           _primaryPointerId = null;
         }
         _mode = _GestureMode.pan;
@@ -385,8 +475,14 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
       _primaryPointerId = event.pointer;
       _downLocal = local;
       final tool = widget.editController.tool;
-      final isPanButton = event.buttons == kMiddleMouseButton || event.buttons == kSecondaryMouseButton;
-      if (isPanButton || tool == CanvasTool.pan) {
+      if (event.buttons == kSecondaryMouseButton) {
+        // Right-click: opens a context menu on release (see
+        // _onPointerUp/_showContextMenuAt) instead of panning or
+        // performing the active tool's action.
+        _mode = _GestureMode.contextMenuPending;
+        return;
+      }
+      if (event.buttons == kMiddleMouseButton || tool == CanvasTool.pan) {
         _mode = _GestureMode.pan;
         _lastFocal = local;
         _lastSpan = null;
@@ -443,6 +539,119 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
       if (e.id == id) return e is TextBoxElement;
     }
     return false;
+  }
+
+  bool _isImageElement(String id) {
+    for (final e in widget.editController.page.elements) {
+      if (e.id == id) return e is ImageElement;
+    }
+    return false;
+  }
+
+  CanvasElement? _findElementById(String id) {
+    for (final e in widget.editController.page.elements) {
+      if (e.id == id) return e;
+    }
+    return null;
+  }
+
+  // --- Long-press (touch) and right-click (mouse) context menus --------
+
+  /// Starts (or restarts) the long-press timer for [elementId], a touch
+  /// pointer that just landed on an image - see [_longPressTimer].
+  void _armLongPress(String elementId, Offset downLocal) {
+    _longPressTimer?.cancel();
+    _longPressElementId = elementId;
+    _longPressDownLocal = downLocal;
+    final pointerId = _primaryPointerId;
+    _longPressTimer = Timer(_longPressDuration, () => _fireLongPress(pointerId));
+  }
+
+  void _cancelLongPress() {
+    _longPressTimer?.cancel();
+    _longPressTimer = null;
+    _longPressElementId = null;
+    _longPressDownLocal = null;
+  }
+
+  void _fireLongPress(int? pointerId) {
+    _longPressTimer = null;
+    final id = _longPressElementId;
+    _longPressElementId = null;
+    // Bail if the finger already lifted, moved on to a different
+    // gesture, or a second finger joined (pinch/pan takes over - see
+    // _onPointerDown) since this timer was armed.
+    if (id == null || pointerId == null || _primaryPointerId != pointerId) return;
+    if (_touchPointerIds.length != 1) return;
+    final el = _findElementById(id);
+    if (el == null) return;
+    // Consume the in-progress select/move gesture (started back in
+    // _onPointerDown/_beginSelectGesture) so lifting the finger
+    // afterward doesn't also register as a tap or a move - the total
+    // delta is zero (the finger never moved, or this wouldn't have
+    // fired), so this is a no-op as far as undo history goes.
+    widget.editController.endMoveSelection();
+    _mode = _GestureMode.none;
+    _primaryPointerId = null;
+    _touchPointerIds.remove(pointerId);
+    _touchPositions.remove(pointerId);
+    HapticFeedback.mediumImpact();
+    final screenRect = widget.viewController.viewport.canvasRectToScreen(el.bounds);
+    final renderBox = context.findRenderObject() as RenderBox;
+    final globalAnchor = renderBox.localToGlobal(screenRect.bottomCenter);
+    unawaited(_showImageMenu(globalAnchor, id));
+  }
+
+  /// Handles a right-click release: selects and shows the Cut/Copy/
+  /// Delete menu if it landed on an image, otherwise shows the Paste
+  /// menu at that point on empty canvas.
+  void _showContextMenuAt(Offset globalPosition, Offset localPosition) {
+    final hitId = _hitTestGrabbableElement(localPosition);
+    if (hitId != null && _isImageElement(hitId)) {
+      if (!widget.editController.selectedElementIds.contains(hitId)) {
+        widget.editController.selectOnly(hitId);
+      }
+      unawaited(_showImageMenu(globalPosition, hitId));
+    } else {
+      final canvasPoint = widget.viewController.viewport.screenToCanvas(localPosition);
+      unawaited(_showPasteMenu(globalPosition, canvasPoint));
+    }
+  }
+
+  Future<void> _showImageMenu(Offset globalPosition, String elementId) async {
+    final overlayBox = Overlay.of(context).context.findRenderObject() as RenderBox;
+    final selected = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(globalPosition & Size.zero, Offset.zero & overlayBox.size),
+      items: const [
+        PopupMenuItem(value: 'cut', child: ListTile(leading: Icon(Icons.content_cut), title: Text('Cut'))),
+        PopupMenuItem(value: 'copy', child: ListTile(leading: Icon(Icons.content_copy), title: Text('Copy'))),
+        PopupMenuItem(value: 'delete', child: ListTile(leading: Icon(Icons.delete_outline), title: Text('Delete'))),
+      ],
+    );
+    if (!mounted) return;
+    switch (selected) {
+      case 'cut':
+        widget.editController.cutSelectedImage();
+      case 'copy':
+        widget.editController.copySelectedImage();
+      case 'delete':
+        widget.editController.deleteSelection();
+    }
+  }
+
+  Future<void> _showPasteMenu(Offset globalPosition, Offset canvasPoint) async {
+    final overlayBox = Overlay.of(context).context.findRenderObject() as RenderBox;
+    final selected = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(globalPosition & Size.zero, Offset.zero & overlayBox.size),
+      items: const [
+        PopupMenuItem(value: 'paste', child: ListTile(leading: Icon(Icons.content_paste), title: Text('Paste'))),
+      ],
+    );
+    if (selected == 'paste') {
+      widget.onRequestPasteAt?.call(canvasPoint);
+    }
   }
 
   /// Called whenever a border-grab gesture (see [_beginBorderGrabIfHit])
@@ -537,8 +746,7 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
         _shapeStartCanvasPoint = canvasPoint;
         widget.editController.startShape(canvasPoint);
       case CanvasTool.lasso:
-        _mode = _GestureMode.lasso;
-        widget.editController.startLasso(canvasPoint);
+        _beginLassoToolGesture(canvasPoint, local);
       case CanvasTool.text:
         // See the matching comment in the touch branch of _onPointerDown:
         // don't place a new box on top of one that's already there.
@@ -552,12 +760,16 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
     }
   }
 
-  void _beginSelectGesture(Offset canvasPoint, Offset localScreenPoint) {
+  /// Returns the id of whatever element got selected (null if this
+  /// landed on a resize handle instead, or on empty canvas and started a
+  /// lasso) - touch's pointer-down handler uses this to know whether to
+  /// arm the long-press timer for an image (see [_armLongPress]).
+  String? _beginSelectGesture(Offset canvasPoint, Offset localScreenPoint) {
     final handle = _hitTestResizeHandle(localScreenPoint);
     if (handle != null) {
       _mode = _GestureMode.resize;
       widget.editController.startResizeSelection(handle, canvasPoint);
-      return;
+      return null;
     }
     _mode = _GestureMode.select;
     final hitId = widget.editController.hitTestTopmost(canvasPoint);
@@ -572,6 +784,37 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
       _selectIsMoving = false;
       widget.editController.startLasso(canvasPoint);
     }
+    return hitId;
+  }
+
+  /// Returns the id of whatever already-selected element got grabbed for
+  /// a move (null if this started a fresh lasso, or grabbed a resize
+  /// handle instead). Shared by the Lasso tool's mouse/stylus/touch
+  /// pointer-down handling - see _beginToolGesture and _onPointerDown.
+  String? _beginLassoToolGesture(Offset canvasPoint, Offset localScreenPoint) {
+    final handle = _hitTestResizeHandle(localScreenPoint);
+    if (handle != null) {
+      _mode = _GestureMode.resize;
+      widget.editController.startResizeSelection(handle, canvasPoint);
+      return null;
+    }
+    // Pressing on something that's already selected (from a prior lasso)
+    // drags the whole current selection around, instead of clearing it
+    // and starting a new lasso rectangle right on top of it. Pressing on
+    // empty canvas - or on an element that *isn't* selected yet - still
+    // starts a fresh lasso, same as before: the Lasso tool's job is
+    // drawing lassos, not click-to-select-one-thing (that's what the
+    // Select tool, and the OneNote-style border-grab shortcut, are for).
+    final hitId = widget.editController.hitTestTopmost(canvasPoint);
+    if (hitId != null && widget.editController.selectedElementIds.contains(hitId)) {
+      _mode = _GestureMode.select;
+      _selectIsMoving = true;
+      widget.editController.startMoveSelection(canvasPoint);
+      return hitId;
+    }
+    _mode = _GestureMode.lasso;
+    widget.editController.startLasso(canvasPoint);
+    return null;
   }
 
   /// True when [canvasPoint] lands inside an already-placed text box.
@@ -655,10 +898,19 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
     if (event.kind == PointerDeviceKind.touch) {
       if (!_touchPointerIds.contains(event.pointer)) return;
       _touchPositions[event.pointer] = local;
+      if (_longPressTimer != null &&
+          _primaryPointerId == event.pointer &&
+          (local - _longPressDownLocal!).distance > _longPressMoveTolerance) {
+        // Moved enough that this is a drag, not a hold - let the normal
+        // select/move handling below take it from here.
+        _cancelLongPress();
+      }
       if (_mode == _GestureMode.pan) {
         _updateTouchPan();
       } else if (_mode == _GestureMode.select && _primaryPointerId == event.pointer) {
         _updateSelectOrLasso(viewport.screenToCanvas(local));
+      } else if (_mode == _GestureMode.lasso && _primaryPointerId == event.pointer) {
+        widget.editController.updateLasso(viewport.screenToCanvas(local));
       } else if (_mode == _GestureMode.resize && _primaryPointerId == event.pointer) {
         widget.editController.updateResizeSelection(viewport.screenToCanvas(local));
       }
@@ -686,6 +938,7 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
       case _GestureMode.pan:
         _updateMousePan(local);
       case _GestureMode.textPending:
+      case _GestureMode.contextMenuPending:
       case _GestureMode.none:
         break;
     }
@@ -735,9 +988,18 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
     if (event.kind == PointerDeviceKind.touch) {
       _touchPointerIds.remove(event.pointer);
       _touchPositions.remove(event.pointer);
+      if (_longPressTimer != null && _primaryPointerId == event.pointer) {
+        // Lifted before the long-press fired - a plain tap/select, which
+        // the branches below already handle normally.
+        _cancelLongPress();
+      }
       if (_mode == _GestureMode.select && _primaryPointerId == event.pointer) {
         _finishSelectGesture();
         _registerBorderGrabTapAndMaybeEditText(event.localPosition);
+        _mode = _GestureMode.none;
+        _primaryPointerId = null;
+      } else if (_mode == _GestureMode.lasso && _primaryPointerId == event.pointer) {
+        widget.editController.endLasso();
         _mode = _GestureMode.none;
         _primaryPointerId = null;
       } else if (_mode == _GestureMode.resize && _primaryPointerId == event.pointer) {
@@ -778,6 +1040,10 @@ class _InfiniteCanvasState extends State<InfiniteCanvas> {
         widget.editController.endResizeSelection();
       case _GestureMode.textPending:
         _finishTextPlacement(event.localPosition, viewport);
+      case _GestureMode.contextMenuPending:
+        if ((event.localPosition - (_downLocal ?? event.localPosition)).distance <= 12) {
+          _showContextMenuAt(event.position, event.localPosition);
+        }
       case _GestureMode.pan:
       case _GestureMode.none:
         break;

@@ -17,16 +17,22 @@ class CanvasViewController extends ChangeNotifier {
 
   void reportSize(Size size) {
     _lastKnownSize = size;
+    // Kept current on every layout (not just the first), since
+    // CanvasViewport.pan's clamping (see its class doc - the page can't
+    // be panned above/left of its own top-left origin) needs to know how
+    // big the viewport is, and that changes whenever the window is
+    // resized.
+    if (size != Size.zero) viewport.viewportSize = size;
     if (_didInitialCentering || size == Size.zero) return;
     _didInitialCentering = true;
-    // Center canvas-origin on screen at 100% zoom, right from the very
-    // first frame - exactly what [resetZoom] below does. Without this,
-    // a freshly-opened page starts with the viewport's raw default
-    // (pan = Offset.zero, i.e. canvas-origin pinned to the screen's
-    // top-left corner) instead, so "Reset zoom" looked like it was
-    // resetting to a *different* place than where the page actually
-    // opens.
-    viewport.pan = Offset(size.width / 2, size.height / 2);
+    // Open right on the page's origin at 100% zoom, right from the very
+    // first frame - exactly what [resetZoom] below does. The title lives
+    // at canvas (0, 0) and content only ever grows right/down from
+    // there, OneNote-style, so - unlike before this existed - there's no
+    // "center of the page" to open on; the top-left corner (with a
+    // small margin - see CanvasViewport.originMargin) is the one fixed
+    // point that always makes sense.
+    viewport.pan = const Offset(CanvasViewport.originMargin, CanvasViewport.originMargin);
   }
 
   Offset get _screenCenter =>
@@ -50,7 +56,7 @@ class CanvasViewController extends ChangeNotifier {
 
   void resetZoom() {
     viewport.scale = 1.0;
-    viewport.pan = _screenCenter;
+    viewport.pan = const Offset(CanvasViewport.originMargin, CanvasViewport.originMargin);
     notifyListeners();
   }
 }

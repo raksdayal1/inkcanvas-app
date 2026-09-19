@@ -35,6 +35,8 @@ class PageEditController extends ChangeNotifier {
   ShapeKind activeShapeKind = ShapeKind.rectangle;
   Color activeColor = Colors.black;
   double activeStrokeWidth = 3.0;
+  double activeFontSize = 18.0;
+  String? activeFontFamily = kDefaultTextFont; // see kTextFontChoices
   static const double eraserRadius = 12.0;
 
   final Set<String> selectedElementIds = {};
@@ -70,6 +72,36 @@ class PageEditController extends ChangeNotifier {
   void setStrokeWidth(double w) {
     activeStrokeWidth = w;
     notifyListeners();
+  }
+
+  /// Sets the font size used for *new* text boxes, and - if a text box is
+  /// currently selected - restyles it too, so picking a size while
+  /// editing existing text changes that text immediately rather than
+  /// only affecting whatever gets typed next.
+  void setFontSize(double size) {
+    activeFontSize = size;
+    _applyToSelectedTextBoxes((t) => t.fontSize = size);
+  }
+
+  /// Same idea as [setFontSize], for the font family.
+  void setFontFamily(String? family) {
+    activeFontFamily = family;
+    _applyToSelectedTextBoxes((t) => t.fontFamily = family);
+  }
+
+  void _applyToSelectedTextBoxes(void Function(TextBoxElement) apply) {
+    var changed = false;
+    for (final el in page.elements) {
+      if (el is TextBoxElement && selectedElementIds.contains(el.id)) {
+        apply(el);
+        changed = true;
+      }
+    }
+    if (changed) {
+      _commit();
+    } else {
+      notifyListeners();
+    }
   }
 
   // --- Ink -----------------------------------------------------------
@@ -524,7 +556,8 @@ class PageEditController extends ChangeNotifier {
       rect: Rect.fromLTWH(canvasPoint.dx, canvasPoint.dy, 220, 60),
       text: '',
       color: activeColor,
-      fontSize: 18,
+      fontSize: activeFontSize,
+      fontFamily: activeFontFamily,
     );
     page.elements.add(box);
     _pushUndo(_AddElementsAction([box]));
@@ -586,6 +619,61 @@ class PageEditController extends ChangeNotifier {
       rect: rect,
       filePath: filePath,
       aspectRatio: aspectRatio,
+    );
+    page.elements.add(img);
+    _pushUndo(_AddElementsAction([img]));
+    _commit();
+  }
+
+  /// The most recently cut/copied image - a simple in-app clipboard
+  /// rather than routing through the OS clipboard, since Windows image
+  /// clipboard writes aren't reliably supported by the packages this app
+  /// already depends on. Static (shared by every open page's controller)
+  /// so a cut/copy on one page can be pasted on another. In-memory only -
+  /// no need to survive an app restart.
+  static _ClipboardImage? _clipboardImage;
+
+  bool get hasClipboardImage => _clipboardImage != null;
+
+  /// Copies the single selected image (a no-op if nothing, or something
+  /// other than exactly one image, is selected).
+  void copySelectedImage() {
+    if (selectedElementIds.length != 1) return;
+    final el = _findElement(selectedElementIds.first);
+    if (el is! ImageElement) return;
+    _clipboardImage = _ClipboardImage(
+      filePath: el.filePath,
+      aspectRatio: el.aspectRatio,
+      width: el.rect.width,
+      height: el.rect.height,
+    );
+  }
+
+  /// Copies the selected image, then removes it from the page - same as
+  /// [copySelectedImage] followed by [deleteSelection].
+  void cutSelectedImage() {
+    if (_readOnly) return;
+    copySelectedImage();
+    deleteSelection();
+  }
+
+  /// Pastes whatever [copySelectedImage]/[cutSelectedImage] last copied,
+  /// centered on [canvasCenter], at its original size - a no-op if
+  /// nothing's been copied yet. The pasted copy shares the same
+  /// underlying image file as the original; that's safe because nothing
+  /// in this app ever deletes an image file out from under a still-live
+  /// element, only the page element referencing it.
+  void pasteClipboardImageAt(Offset canvasCenter) {
+    if (_readOnly) return;
+    final clip = _clipboardImage;
+    if (clip == null) return;
+    final rect = Rect.fromCenter(center: canvasCenter, width: clip.width, height: clip.height);
+    final img = ImageElement(
+      id: _uuid.v4(),
+      createdAt: DateTime.now(),
+      rect: rect,
+      filePath: clip.filePath,
+      aspectRatio: clip.aspectRatio,
     );
     page.elements.add(img);
     _pushUndo(_AddElementsAction([img]));
@@ -749,4 +837,22 @@ class _EditTextAction extends _UndoableAction {
   void redo(PageEditController c) {
     _find(c)?.text = after;
   }
+}
+
+/// What [PageEditController.copySelectedImage]/[cutSelectedImage] stash
+/// away - enough to recreate an equivalent [ImageElement] on paste,
+/// including its size (rather than falling back to [addImageAt]'s
+/// default box, which would silently resize the pasted copy).
+class _ClipboardImage {
+  _ClipboardImage({
+    required this.filePath,
+    required this.aspectRatio,
+    required this.width,
+    required this.height,
+  });
+
+  final String filePath;
+  final double? aspectRatio;
+  final double width;
+  final double height;
 }

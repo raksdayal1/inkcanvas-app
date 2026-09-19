@@ -5,12 +5,15 @@ import 'dart:ui' as ui;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:pasteboard/pasteboard.dart';
 import 'package:provider/provider.dart';
 
+import '../canvas/canvas_tools.dart';
 import '../canvas/canvas_view_controller.dart';
 import '../canvas/infinite_canvas.dart';
 import '../canvas/page_edit_controller.dart';
+import '../models/canvas_element.dart';
 import '../models/page.dart';
 import '../state/library_controller.dart';
 import '../storage/local_store.dart';
@@ -128,14 +131,19 @@ class _PageScreenState extends State<PageScreen> {
         leading: widget.onOpenDrawer == null
             ? null
             : IconButton(icon: const Icon(Icons.menu), onPressed: widget.onOpenDrawer),
-        title: TextField(
-          controller: _titleController,
-          focusNode: _titleFocusNode,
-          readOnly: readOnly,
-          decoration: const InputDecoration(border: InputBorder.none),
-          style: Theme.of(context).textTheme.titleMedium,
-          onSubmitted: _renamePage,
-          onEditingComplete: () => _renamePage(_titleController.text),
+        // The page's own title now lives in [_buildTitleHeader], as a big
+        // OneNote-style heading above the canvas rather than squeezed
+        // into this bar. This bar's title slot is otherwise empty space,
+        // so that's where the font controls go instead - visible right
+        // up top exactly when there's a text box selected/being edited,
+        // rather than pushing the canvas down with a row of their own.
+        titleSpacing: 0,
+        title: AnimatedBuilder(
+          animation: _editController,
+          builder: (context, _) {
+            final box = _selectedTextBox;
+            return box == null ? const SizedBox.shrink() : _buildFormattingBar(context, box, readOnly);
+          },
         ),
         actions: [
           const ConnectionIndicator(),
@@ -181,39 +189,186 @@ class _PageScreenState extends State<PageScreen> {
         // to this ancestor.
         autofocus: true,
         onKeyEvent: _handlePageKeyEvent,
-        child: Builder(
-          builder: (context) {
-            // The canvas itself stays full-bleed (a drawing surface should
-            // use every pixel), but the floating toolbar and zoom controls
-            // need to stay clear of the system nav bar / gesture area at
-            // the bottom of the screen - otherwise they end up partly
-            // behind it, looking like they're "overlapping" system UI.
-            final bottomInset = MediaQuery.paddingOf(context).bottom;
-            return Stack(
-              children: [
-                Positioned.fill(
-                  child: InfiniteCanvas(editController: _editController, viewController: _viewController),
-                ),
-                Positioned(
-                  left: 8,
-                  top: 8,
-                  bottom: 8 + bottomInset,
-                  child: IgnorePointer(
-                    ignoring: readOnly,
-                    child: Opacity(
-                      opacity: readOnly ? 0.4 : 1.0,
-                      child: CanvasToolbar(editController: _editController, onInsertImage: _pickAndInsertImage),
-                    ),
-                  ),
-                ),
-                Positioned(
-                  right: 12,
-                  bottom: 12 + bottomInset,
-                  child: _ZoomControls(viewController: _viewController),
-                ),
-              ],
-            );
-          },
+        child: Column(
+          children: [
+            _buildTitleHeader(context, readOnly),
+            Expanded(
+              child: Builder(
+                builder: (context) {
+                  // The canvas itself stays full-bleed (a drawing surface
+                  // should use every pixel), but the floating toolbar and
+                  // zoom controls need to stay clear of the system nav
+                  // bar / gesture area at the bottom of the screen -
+                  // otherwise they end up partly behind it, looking like
+                  // they're "overlapping" system UI.
+                  final bottomInset = MediaQuery.paddingOf(context).bottom;
+                  return Stack(
+                    children: [
+                      Positioned.fill(
+                        child: InfiniteCanvas(
+                          editController: _editController,
+                          viewController: _viewController,
+                          onRequestPasteAt: _pasteAt,
+                        ),
+                      ),
+                      Positioned(
+                        left: 8,
+                        top: 8,
+                        bottom: 8 + bottomInset,
+                        child: IgnorePointer(
+                          ignoring: readOnly,
+                          child: Opacity(
+                            opacity: readOnly ? 0.4 : 1.0,
+                            child: CanvasToolbar(editController: _editController, onInsertImage: _pickAndInsertImage),
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        right: 12,
+                        bottom: 12 + bottomInset,
+                        child: _ZoomControls(viewController: _viewController),
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  static const _weekdayNames = [
+    'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday',
+  ];
+  static const _monthNames = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+  ];
+
+  /// Formats like OneNote's page-info line: "Monday, February 24, 2025
+  /// 12:24 PM". Uses lastModified rather than a separate created-at
+  /// (which this app doesn't track) - close enough to OneNote's date
+  /// line for a note-taking app that's usually looked at read fairly
+  /// soon after it's written or edited.
+  String _formatPageDate(DateTime dt) {
+    final weekday = _weekdayNames[dt.weekday - 1];
+    final month = _monthNames[dt.month - 1];
+    final hour12 = dt.hour % 12 == 0 ? 12 : dt.hour % 12;
+    final minute = dt.minute.toString().padLeft(2, '0');
+    final ampm = dt.hour >= 12 ? 'PM' : 'AM';
+    return '$weekday, $month ${dt.day}, ${dt.year}    $hour12:$minute $ampm';
+  }
+
+  /// The page's title as a big heading anchored at the top of the page,
+  /// with an underline and a "last edited" line beneath it - the same
+  /// shape as OneNote's own page header, and (together with the
+  /// panning limits in CanvasViewport) what makes the title read as the
+  /// page's fixed anchor point rather than just another toolbar.
+  Widget _buildTitleHeader(BuildContext context, bool readOnly) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            decoration: BoxDecoration(
+              border: Border(bottom: BorderSide(color: theme.colorScheme.outlineVariant)),
+            ),
+            padding: const EdgeInsets.only(bottom: 6),
+            child: TextField(
+              controller: _titleController,
+              focusNode: _titleFocusNode,
+              readOnly: readOnly,
+              decoration: const InputDecoration(
+                border: InputBorder.none,
+                isDense: true,
+                contentPadding: EdgeInsets.zero,
+                hintText: 'Untitled page',
+              ),
+              style: theme.textTheme.headlineSmall,
+              onSubmitted: _renamePage,
+              onEditingComplete: () => _renamePage(_titleController.text),
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            _formatPageDate(widget.page.lastModified),
+            style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// The single selected [TextBoxElement], if there's exactly one - both
+  /// an active selection (Select tool) and actively typing into a box
+  /// (Text tool - see InfiniteCanvas's focus-gained handling) put it
+  /// here, which is what lets [_buildFormattingBar] act on whichever one
+  /// you're actually working with.
+  TextBoxElement? get _selectedTextBox {
+    if (_editController.selectedElementIds.length != 1) return null;
+    final id = _editController.selectedElementIds.first;
+    for (final el in _editController.page.elements) {
+      if (el.id == id) return el is TextBoxElement ? el : null;
+    }
+    return null;
+  }
+
+  /// A slim OneNote-style formatting bar - font family and size - shown
+  /// right below the title header whenever [box] is the one selected/
+  /// being-edited text box, instead of buried in the side toolbar's
+  /// popups.
+  Widget _buildFormattingBar(BuildContext context, TextBoxElement box, bool readOnly) {
+    // box.fontFamily is null for a text box that predates the font
+    // feature (or was never explicitly restyled) - kDefaultTextFont is
+    // what null effectively renders as (see PageEditController and
+    // kTextFontChoices), so that's what the dropdown should show
+    // selected rather than a value that isn't one of its own items.
+    final currentFamily = box.fontFamily ?? kDefaultTextFont;
+    return IgnorePointer(
+      ignoring: readOnly,
+      child: Opacity(
+        opacity: readOnly ? 0.4 : 1.0,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.text_fields, size: 18),
+            const SizedBox(width: 8),
+            DropdownButtonHideUnderline(
+              child: DropdownButton<String>(
+                value: currentFamily,
+                isDense: true,
+                items: kTextFontChoices.entries
+                    .map(
+                      (e) => DropdownMenuItem(
+                        value: e.value,
+                        child: Text(e.key, style: GoogleFonts.getFont(e.value)),
+                      ),
+                    )
+                    .toList(),
+                onChanged: (family) {
+                  if (family != null) _editController.setFontFamily(family);
+                },
+              ),
+            ),
+            const SizedBox(width: 16),
+            IconButton(
+              icon: const Icon(Icons.remove_circle_outline),
+              iconSize: 20,
+              tooltip: 'Smaller',
+              onPressed: () => _editController.setFontSize((box.fontSize - 2).clamp(10, 72)),
+            ),
+            SizedBox(width: 26, child: Text('${box.fontSize.round()}', textAlign: TextAlign.center)),
+            IconButton(
+              icon: const Icon(Icons.add_circle_outline),
+              iconSize: 20,
+              tooltip: 'Larger',
+              onPressed: () => _editController.setFontSize((box.fontSize + 2).clamp(10, 72)),
+            ),
+          ],
         ),
       ),
     );
@@ -230,14 +385,21 @@ class _PageScreenState extends State<PageScreen> {
   KeyEventResult _handlePageKeyEvent(FocusNode node, KeyEvent event) {
     // Delete/Backspace removes the current selection (a selected text
     // box or image, grabbed via the Select tool or the mouse edge-grab
-    // shortcut) - as long as nothing has stolen keyboard focus for its
-    // own use. A text box actively being edited holds that focus itself,
-    // so its own Delete/Backspace handling (editing its text) always
-    // gets first crack and this is never reached while typing - only
-    // when something is selected but not being typed into.
+    // shortcut) - but only when this page-level FocusNode itself is the
+    // one holding focus (node.hasPrimaryFocus), not some descendant like
+    // a text box's own TextField. A text box being actively typed into is
+    // now *also* added to selectedElementIds (so the font controls can
+    // reach it - see the FocusNode listener in infinite_canvas.dart), so
+    // checking selectedElementIds alone is no longer enough to tell "a
+    // box is selected" apart from "a box is being typed into" - without
+    // this check, every Backspace while typing was deleting the whole
+    // box instead of a character. node.hasPrimaryFocus is false whenever
+    // a descendant (the TextField) actually has focus, so this shortcut
+    // naturally steps aside and lets normal text editing happen.
     if (event is KeyDownEvent &&
         (event.logicalKey == LogicalKeyboardKey.delete ||
             event.logicalKey == LogicalKeyboardKey.backspace) &&
+        node.hasPrimaryFocus &&
         _editController.selectedElementIds.isNotEmpty) {
       _editController.deleteSelection();
       return KeyEventResult.handled;
@@ -246,20 +408,31 @@ class _PageScreenState extends State<PageScreen> {
     if (event is KeyDownEvent &&
         event.logicalKey == LogicalKeyboardKey.keyV &&
         HardwareKeyboard.instance.isControlPressed) {
-      _pasteImageFromClipboard();
+      _pasteAt(_viewController.canvasCenter);
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
   }
 
-  Future<void> _pasteImageFromClipboard() async {
+  /// Pastes an image at [canvasPoint] - used by both Ctrl+V (pastes at
+  /// the canvas center) and the canvas's right-click "Paste" menu item
+  /// (pastes right where you clicked). Tries the in-app clipboard first
+  /// (whatever was last Cut/Copied on the canvas itself, on this page or
+  /// another one), and only falls back to the OS clipboard - the
+  /// original Ctrl+V behavior, for pasting in a screenshot or an image
+  /// copied from another app - if nothing's been cut/copied in-app.
+  Future<void> _pasteAt(Offset canvasPoint) async {
+    if (_editController.hasClipboardImage) {
+      _editController.pasteClipboardImageAt(canvasPoint);
+      return;
+    }
     final bytes = await Pasteboard.image;
     if (bytes == null) return; // clipboard has no image on it (e.g. plain text) - nothing to do
     if (!mounted) return;
     final storedPath = await _localStore.importImageBytes(bytes, 'pasted.png');
     final aspectRatio = await _decodeAspectRatio(bytes);
     if (!mounted) return;
-    _editController.addImageAt(_viewController.canvasCenter, storedPath, aspectRatio: aspectRatio);
+    _editController.addImageAt(canvasPoint, storedPath, aspectRatio: aspectRatio);
   }
 
   /// The source image's real width/height ratio, so the box it's dropped

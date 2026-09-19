@@ -27,9 +27,15 @@ class CanvasToolbar extends StatelessWidget {
           margin: EdgeInsets.zero,
           child: Padding(
             padding: const EdgeInsets.symmetric(vertical: 6),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
+            // The toolbar's button list has grown enough that on shorter
+            // windows/screens it can exceed the fixed height the Positioned
+            // in page_screen.dart gives it (RenderFlex overflow). Making it
+            // scrollable keeps every button reachable instead of clipping
+            // or crashing the layout.
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
                 _toolButton(context, CanvasTool.pen, Icons.edit, 'Pen'),
                 _toolButton(context, CanvasTool.highlighter, Icons.brush, 'Highlighter'),
                 _toolButton(context, CanvasTool.eraser, Icons.auto_fix_normal, 'Eraser'),
@@ -62,7 +68,8 @@ class CanvasToolbar extends StatelessWidget {
                   tooltip: 'Delete selection',
                   onPressed: editController.selectedElementIds.isEmpty ? null : editController.deleteSelection,
                 ),
-              ],
+                ],
+              ),
             ),
           ),
         );
@@ -187,4 +194,5 @@ class CanvasToolbar extends StatelessWidget {
       ],
     );
   }
+
 }

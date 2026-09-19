@@ -24,6 +24,11 @@ dependencies:
   # Reads images off the system clipboard (Ctrl+V paste-to-insert on Windows)
   pasteboard: ^0.5.0
 
+  # Bundled cross-platform text fonts for text boxes, so a chosen font
+  # renders identically on Windows and Android instead of depending on
+  # whatever's installed on the OS
+  google_fonts: ^6.2.1
+
   # Stable unique IDs for notebooks/sections/pages/canvas elements
   uuid: ^4.4.0
 
