@@ -20,9 +20,15 @@ import 'package:google_fonts/google_fonts.dart';
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
 
-  static const backgroundColor = Color(0xFF150E09);
-  static const _gold = Color(0xFFD6AD54);
-  static const _dimGold = Color(0xFF8A6A3A);
+  // Light, parchment-toned palette (matches the app icon's background -
+  // see the icon generator script and pubspec.yaml's adaptive_icon_
+  // background/flutter_native_splash colors, all #F4ECD8) rather than the
+  // original dark version - a deep espresso-brown ink for text/the
+  // spinner reads cleanly against it without needing a dark backdrop.
+  static const backgroundColor = Color(0xFFF4ECD8);
+  static const _highlight = Color(0xFFFFFDF6);
+  static const _ink = Color(0xFF7A4E1D);
+  static const _mutedInk = Color(0xFFA9895C);
 
   @override
   State<SplashScreen> createState() => _SplashScreenState();
@@ -63,9 +69,11 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
         builder: (context, _) {
           return Stack(
             children: [
-              // Soft warm glow behind the logo, echoing the app-icon
-              // artwork's own background glow (see the icon generator) so
-              // the splash reads as the same piece of branding.
+              // Subtle light vignette behind the logo - a touch brighter
+              // at center, echoing the app-icon artwork's own vignette
+              // (see the icon generator) so the splash reads as the same
+              // piece of branding, without the murkiness a dark glow
+              // would add on top of a light background.
               Positioned.fill(
                 child: IgnorePointer(
                   child: DecoratedBox(
@@ -74,7 +82,7 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
                         center: const Alignment(0, -0.1),
                         radius: 0.9,
                         colors: [
-                          SplashScreen._dimGold.withValues(alpha: 0.16 * _logoFade.value),
+                          SplashScreen._highlight.withValues(alpha: 0.7 * _logoFade.value),
                           SplashScreen.backgroundColor,
                         ],
                       ),
@@ -105,7 +113,7 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
                         style: GoogleFonts.cinzelDecorative(
                           fontSize: 30,
                           fontWeight: FontWeight.w700,
-                          color: SplashScreen._gold,
+                          color: SplashScreen._ink,
                           letterSpacing: 1.5,
                         ),
                       ),
@@ -119,7 +127,7 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
                           fontSize: 11,
                           fontWeight: FontWeight.w500,
                           letterSpacing: 3.2,
-                          color: SplashScreen._dimGold,
+                          color: SplashScreen._mutedInk,
                         ),
                       ),
                     ),
@@ -131,7 +139,7 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
                         height: 22,
                         child: CircularProgressIndicator(
                           strokeWidth: 2.2,
-                          valueColor: AlwaysStoppedAnimation<Color>(SplashScreen._dimGold),
+                          valueColor: AlwaysStoppedAnimation<Color>(SplashScreen._mutedInk),
                         ),
                       ),
                     ),

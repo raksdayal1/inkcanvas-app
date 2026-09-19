@@ -59,7 +59,7 @@ flutter:
 flutter_launcher_icons:
   android: "launcher_icon"
   image_path: "assets/icon/app_icon.png"
-  adaptive_icon_background: "#150E09"
+  adaptive_icon_background: "#F4ECD8"
   adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"
   windows:
     generate: true
@@ -69,8 +69,8 @@ flutter_launcher_icons:
 # --- flutter_native_splash config: `dart run flutter_native_splash:create` ---
 # (Android/iOS/web only - see the comment on the dependency above.)
 flutter_native_splash:
-  color: "#150E09"
+  color: "#F4ECD8"
   image: "assets/icon/app_icon_foreground.png"
   android_12:
-    color: "#150E09"
+    color: "#F4ECD8"
     image: "assets/icon/app_icon_foreground.png"

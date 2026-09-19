@@ -16,6 +16,17 @@ import 'ui/splash_screen.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // Show the splash immediately, before any of the boot work below - all
+  // of that (reading device identity/pairing state and the notebook
+  // library from disk) runs locally and is normally close to instant, far
+  // too fast to actually register as a splash screen on its own. Booting
+  // in two stages like this - one `runApp` for the splash, a second one
+  // once everything's ready - both gets the splash on screen straight
+  // away and (via `minSplashDuration` below) keeps it there for a beat
+  // even when the real work finishes almost immediately.
+  runApp(const _BootSplash());
+  final minSplashDuration = Future<void>.delayed(const Duration(milliseconds: 3100));
+
   final store = LocalStore();
   final appDir = await store.appDirectory();
   final identity = await DeviceIdentity.load(appDir);
@@ -36,7 +47,25 @@ Future<void> main() async {
   await library.load();
   syncEngine.start();
 
+  await minSplashDuration;
+
   runApp(InkCanvasApp(library: library, syncEngine: syncEngine));
+}
+
+/// What `runApp` shows for the very first frame, before the real
+/// [InkCanvasApp] (with its providers, theme, etc.) exists yet - just
+/// enough of a widget tree (MaterialApp, for Directionality/Material
+/// ancestry) to host [SplashScreen] on its own.
+class _BootSplash extends StatelessWidget {
+  const _BootSplash();
+
+  @override
+  Widget build(BuildContext context) {
+    return const MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: SplashScreen(),
+    );
+  }
 }
 
 class InkCanvasApp extends StatelessWidget {
