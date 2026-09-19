@@ -11,6 +11,7 @@ import 'sync/device_identity.dart';
 import 'sync/pairing_store.dart';
 import 'sync/sync_engine.dart';
 import 'ui/home_screen.dart';
+import 'ui/splash_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -73,7 +74,7 @@ class _AppRoot extends StatelessWidget {
   Widget build(BuildContext context) {
     final library = context.watch<LibraryController>();
     if (!library.loaded) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      return const SplashScreen();
     }
     return const _PairingApprovalGate(child: HomeScreen());
   }

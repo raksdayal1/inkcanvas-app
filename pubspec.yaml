@@ -1,7 +1,7 @@
 name: inkcanvas_app
 description: A OneNote-style notebook app with an infinite zoomable canvas for pen, text, images, and shapes.
 publish_to: 'none'
-version: 0.1.0
+version: 1.0.0+1
 
 environment:
   sdk: '>=3.4.0 <4.0.0'
@@ -37,5 +37,40 @@ dev_dependencies:
     sdk: flutter
   flutter_lints: ^4.0.0
 
+  # Generates the Windows .ico and Android launcher-icon/adaptive-icon
+  # assets from assets/icon/*.png below - run with:
+  #   dart run flutter_launcher_icons
+  flutter_launcher_icons: ^0.14.4
+
+  # Generates the native (pre-Flutter-engine) Android splash screen from
+  # the same artwork - run with:
+  #   dart run flutter_native_splash:create
+  # (Windows desktop has no native pre-engine splash hook; see
+  # lib/ui/splash_screen.dart for the in-app splash shown there instead.)
+  flutter_native_splash: ^2.4.8
+
 flutter:
   uses-material-design: true
+
+  assets:
+    - assets/icon/app_icon_foreground.png
+
+# --- flutter_launcher_icons config: `dart run flutter_launcher_icons` ---
+flutter_launcher_icons:
+  android: "launcher_icon"
+  image_path: "assets/icon/app_icon.png"
+  adaptive_icon_background: "#150E09"
+  adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"
+  windows:
+    generate: true
+    image_path: "assets/icon/app_icon.png"
+    icon_size: 256
+
+# --- flutter_native_splash config: `dart run flutter_native_splash:create` ---
+# (Android/iOS/web only - see the comment on the dependency above.)
+flutter_native_splash:
+  color: "#150E09"
+  image: "assets/icon/app_icon_foreground.png"
+  android_12:
+    color: "#150E09"
+    image: "assets/icon/app_icon_foreground.png"
