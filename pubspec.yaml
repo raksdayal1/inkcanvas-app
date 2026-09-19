@@ -32,6 +32,11 @@ dependencies:
   # Stable unique IDs for notebooks/sections/pages/canvas elements
   uuid: ^4.4.0
 
+  # Real device manufacturer/model (Android) for a sensible default sync
+  # device name, instead of a generic "Android device" placeholder - see
+  # DeviceIdentity._defaultName()
+  device_info_plus: ^13.2.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

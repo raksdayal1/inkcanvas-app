@@ -9,6 +9,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:device_info_plus/device_info_plus.dart';
 import 'package:uuid/uuid.dart';
 
 class DeviceIdentity {
@@ -47,17 +48,38 @@ class DeviceIdentity {
       }
     }
 
-    final identity = DeviceIdentity._(const Uuid().v4(), _defaultName(), file);
+    final identity = DeviceIdentity._(const Uuid().v4(), await _defaultName(), file);
     await identity._save();
     return _cached = identity;
   }
 
-  static String _defaultName() {
+  static Future<String> _defaultName() async {
     if (Platform.isWindows) {
       final computerName = Platform.environment['COMPUTERNAME'];
       return (computerName == null || computerName.isEmpty) ? 'Windows PC' : computerName;
     }
-    if (Platform.isAndroid) return 'Android device';
+    if (Platform.isAndroid) {
+      // Unlike Windows' COMPUTERNAME, Android doesn't expose the personal
+      // nickname you gave the device (e.g. in Bluetooth/system settings)
+      // to third-party apps without extra runtime permissions we'd
+      // otherwise have no reason to ask for. Manufacturer + model (e.g.
+      // "Samsung SM-X710") is the closest thing available for free, and
+      // beats a generic "Android device" default when there's more than
+      // one Android device pairing in - a real personal name is still
+      // just a rename away in the Sync screen (see [rename]).
+      try {
+        final info = await DeviceInfoPlugin().androidInfo;
+        final manufacturer = info.manufacturer.trim();
+        final model = info.model.trim();
+        if (model.isEmpty) return 'Android device';
+        if (manufacturer.isEmpty || model.toLowerCase().startsWith(manufacturer.toLowerCase())) {
+          return model;
+        }
+        return '${manufacturer[0].toUpperCase()}${manufacturer.substring(1)} $model';
+      } catch (_) {
+        return 'Android device';
+      }
+    }
     return Platform.operatingSystem;
   }
 
