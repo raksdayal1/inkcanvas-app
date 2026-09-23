@@ -1,3 +1,6 @@
+import 'dart:async';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -6,6 +9,7 @@ import '../state/library_controller.dart';
 import '../sync/sync_engine.dart';
 import 'notebook_screen.dart';
 import 'widgets/connection_indicator.dart';
+import 'widgets/notebook_dialogs.dart';
 
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key});
@@ -34,6 +38,21 @@ class _NotebookGrid extends StatelessWidget {
         toolbarHeight: 68,
         actions: [
           const ConnectionIndicator(large: true),
+          PopupMenuButton<String>(
+            tooltip: 'Library backup',
+            icon: const Icon(Icons.more_vert),
+            onSelected: (value) {
+              if (value == 'export') {
+                unawaited(_exportBackup(context, library));
+              } else if (value == 'import') {
+                unawaited(_importBackup(context, library));
+              }
+            },
+            itemBuilder: (context) => const [
+              PopupMenuItem(value: 'export', child: Text('Export library backup')),
+              PopupMenuItem(value: 'import', child: Text('Import library backup')),
+            ],
+          ),
         ],
       ),
       body: library.notebooks.isEmpty
@@ -65,7 +84,8 @@ class _NotebookGrid extends StatelessWidget {
                     readOnly: readOnly,
                     subtitle: ownedByMe ? null : 'Owned by ${notebook.ownerDeviceName ?? 'another device'}',
                     onTap: () => library.openNotebook(notebook.id),
-                    onDelete: canDelete ? () => _confirmDelete(context, library, notebook.id, notebook.title) : null,
+                    onRename: readOnly ? null : () => renameNotebookFlow(context, library, notebook),
+                    onDelete: canDelete ? () => deleteNotebookFlow(context, library, notebook) : null,
                   );
                 },
               ),
@@ -87,33 +107,64 @@ class _NotebookGrid extends StatelessWidget {
     }
   }
 
-  Future<void> _confirmDelete(
-    BuildContext context,
-    LibraryController library,
-    String notebookId,
-    String title,
-  ) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text('Delete "$title"?'),
-        content: const Text('This deletes all sections and pages inside it. This can\'t be undone.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
-          TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('Delete')),
-        ],
-      ),
-    );
-    if (confirmed == true) {
-      try {
-        await library.deleteNotebook(notebookId);
-      } on NotYourNotebookException {
-        if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("Only the device that owns this notebook can delete it.")),
-          );
-        }
-      }
+  /// Saves the whole library (every notebook, section, page, and every
+  /// image any of them reference - see LibraryController.exportBackupBytes)
+  /// to a file the user picks, via file_picker's native save dialog -
+  /// this is a plain file on disk, independent of Android's own backup
+  /// system (which android:allowBackup="false" in AndroidManifest.xml
+  /// deliberately turns off) and of this device's signing key, so it
+  /// survives a forced uninstall/reinstall that wipes everything else.
+  Future<void> _exportBackup(BuildContext context, LibraryController library) async {
+    try {
+      final bytes = await library.exportBackupBytes();
+      final timestamp = DateTime.now().toIso8601String().replaceAll(RegExp(r'[:.]'), '-');
+      final uri = await FilePicker.saveFile(
+        fileName: 'na-pustakam-backup-$timestamp.npbk',
+        bytes: bytes,
+        dialogTitle: 'Save Na-Pustakam library backup',
+        // Without this, the save dialog can open behind the main window
+        // on Windows and look like nothing happened - see the identical
+        // fix on the image-insertion picker in page_screen.dart.
+        windowsOptions: const WindowsOptions(lockParentWindow: true),
+      );
+      if (!context.mounted || uri == null) return; // uri is null if the user cancelled
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Library backup saved.')),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Export failed: $e')),
+      );
+    }
+  }
+
+  /// Restores notebooks from a file previously written by [_exportBackup] -
+  /// see LibraryController.importBackup for exactly what "restore" means
+  /// here (additive, never overwrites or deletes anything already
+  /// present).
+  Future<void> _importBackup(BuildContext context, LibraryController library) async {
+    try {
+      final picked = await FilePicker.pickFile(
+        dialogTitle: 'Select a Na-Pustakam library backup',
+        windowsOptions: const WindowsOptions(lockParentWindow: true),
+      );
+      if (picked == null) return; // cancelled
+      final bytes = await picked.readAsBytes();
+      final result = await library.importBackup(bytes);
+      if (!context.mounted) return;
+      final parts = <String>[];
+      if (result.imported > 0) parts.add('restored ${result.imported} notebook(s)');
+      if (result.alreadyPresent > 0) parts.add('${result.alreadyPresent} already present');
+      if (result.skippedDeleted > 0) parts.add('${result.skippedDeleted} skipped (previously deleted here)');
+      final message = parts.isEmpty ? 'Nothing to import - the backup had no notebooks.' : '${parts.join(', ')}.';
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    } on FormatException catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Import failed: $e')));
     }
   }
 }
@@ -125,6 +176,7 @@ class _NotebookCard extends StatelessWidget {
     required this.readOnly,
     required this.subtitle,
     required this.onTap,
+    required this.onRename,
     required this.onDelete,
   });
 
@@ -133,6 +185,7 @@ class _NotebookCard extends StatelessWidget {
   final bool readOnly;
   final String? subtitle;
   final VoidCallback onTap;
+  final VoidCallback? onRename;
   final VoidCallback? onDelete;
 
   @override
@@ -144,11 +197,12 @@ class _NotebookCard extends StatelessWidget {
       child: InkWell(
         borderRadius: BorderRadius.circular(12),
         onTap: onTap,
-        onLongPress: onDelete,
-        // Long-press already deletes (touch-friendly), but that's not a
-        // discoverable gesture with a mouse - right-click and the small
-        // trash icon below give Windows/desktop users an obvious way in.
-        onSecondaryTapDown: onDelete == null ? null : (_) => onDelete!(),
+        // Long-press/right-click open a Rename/Delete menu (mirroring
+        // _SectionTab/_NotebookTab in notebook_screen.dart) rather than
+        // firing delete straight away - the small trash icon below is
+        // still there for a one-tap delete once you know it's there.
+        onLongPress: () => _showMenu(context, _globalCenterOf(context)),
+        onSecondaryTapDown: (details) => _showMenu(context, details.globalPosition),
         child: Padding(
           padding: const EdgeInsets.all(12),
           child: Stack(
@@ -224,6 +278,27 @@ class _NotebookCard extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+
+  Offset _globalCenterOf(BuildContext context) {
+    final renderBox = context.findRenderObject() as RenderBox;
+    return renderBox.localToGlobal(renderBox.size.center(Offset.zero));
+  }
+
+  void _showMenu(BuildContext context, Offset globalPosition) {
+    showMenu(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromPoints(globalPosition, globalPosition),
+        Offset.zero & MediaQuery.sizeOf(context),
+      ),
+      items: [
+        if (onRename != null) PopupMenuItem(onTap: onRename, child: const Text('Rename')),
+        if (onDelete != null) PopupMenuItem(onTap: onDelete, child: const Text('Delete')),
+        if (onRename == null && onDelete == null)
+          const PopupMenuItem(enabled: false, child: Text('Read-only — connect to edit')),
+      ],
     );
   }
 }

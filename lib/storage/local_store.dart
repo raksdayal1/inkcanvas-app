@@ -760,6 +760,58 @@ class LocalStore {
   /// do) or any other failure (permissions, a locked file, a bad path)
   /// is swallowed rather than thrown - a failed cleanup attempt should
   /// never block or crash the deletion that triggered it.
+  /// Every distinct image file referenced by [notebooks]' pages (by
+  /// [ImageElement.filePath]) that still exists on disk right now,
+  /// keyed by its basename - the inverse of [restoreImageBytes], used
+  /// by LibraryController.exportBackupBytes to bundle actual image
+  /// bytes into a backup file instead of just a path that won't exist
+  /// on whatever device/install restores it later. Best-effort: an
+  /// image file that's gone missing (shouldn't normally happen, but
+  /// isn't this method's job to fix) is silently skipped rather than
+  /// failing the whole export.
+  Future<Map<String, Uint8List>> collectReferencedImageBytes(List<Notebook> notebooks) async {
+    final result = <String, Uint8List>{};
+    for (final notebook in notebooks) {
+      for (final section in notebook.sections) {
+        for (final page in section.pages) {
+          for (final el in page.elements) {
+            if (el is! ImageElement) continue;
+            final basename = el.filePath.substring(el.filePath.lastIndexOf('/') + 1);
+            if (result.containsKey(basename)) continue; // already collected (content-hash dedup - see importImageBytes)
+            try {
+              final file = File(el.filePath);
+              if (await file.exists()) {
+                result[basename] = await file.readAsBytes();
+              }
+            } catch (e) {
+              // ignore: avoid_print
+              print('LocalStore: failed to read image $basename for backup: $e');
+            }
+          }
+        }
+      }
+    }
+    return result;
+  }
+
+  /// Writes one image bundled inside an imported backup file (see
+  /// [collectReferencedImageBytes]/library_backup_codec.dart) into this
+  /// device's own images/ folder under the same [filename] it was
+  /// exported with - ImageElement.filePath is an absolute path, and
+  /// LibraryController.importBackup rewrites each restored element's
+  /// filePath to point at this device's own imagesDir + filename before
+  /// this is called, so the two stay in sync. Skips writing if a file
+  /// with that name already exists (the same content-hash dedup
+  /// [importImageBytes] uses - a restore after a partial/failed earlier
+  /// import, or importing the same backup twice, won't duplicate work).
+  Future<void> restoreImageBytes(String filename, Uint8List bytes) async {
+    final imagesDir = await _imagesDir();
+    final file = File('${imagesDir.path}/$filename');
+    if (!await file.exists()) {
+      await file.writeAsBytes(bytes);
+    }
+  }
+
   Future<void> deleteImageFile(String path) async {
     try {
       final file = File(path);
