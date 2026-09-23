@@ -549,6 +549,13 @@ class SyncEngine extends ChangeNotifier {
         for (final element in page.elements) {
           if (element is ImageElement) basenames.add(_basename(element.filePath));
         }
+        // Embedded local-file links (NotePage.embeddedLinks) live in
+        // this same imagesDir, named the same content-hash way - see
+        // LocalStore.importLinkedFile - so they ride along on the same
+        // "images" transfer below with no changes needed on the
+        // receiving end: _handleNotebookData already writes any
+        // basename it doesn't already have, whatever it actually is.
+        basenames.addAll(page.embeddedLinks.values);
       }
     }
 

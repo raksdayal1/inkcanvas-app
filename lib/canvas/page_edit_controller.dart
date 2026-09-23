@@ -1,8 +1,11 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
 
 import '../models/canvas_element.dart';
 import '../models/page.dart';
+import '../storage/page_change_set.dart';
 import 'canvas_tools.dart';
 
 const _uuid = Uuid();
@@ -11,12 +14,32 @@ const _uuid = Uuid();
 /// for editing it. Repaint-relevant state changes call [notifyListeners]
 /// immediately (cheap, in-memory); [onContentChanged] fires only when a
 /// gesture actually completes, so the caller can persist to disk without
-/// writing on every single pointer-move event.
+/// writing on every single pointer-move event. Called with exactly which
+/// element ids were added/changed/removed by that gesture (see
+/// [PageChangeSet] and [_pendingChanges]) so the caller (LibraryController,
+/// via LocalStore's binary revision log) can persist just those elements
+/// instead of the whole page.
 class PageEditController extends ChangeNotifier {
-  PageEditController(this.page, {this.onContentChanged});
+  PageEditController(this.page, {this.onContentChanged, this.onTextCommitted});
 
   final NotePage page;
-  final VoidCallback? onContentChanged;
+  final void Function(PageChangeSet changes)? onContentChanged;
+
+  /// Which element ids have been added/changed ("put") or removed
+  /// ("deleted") since the last [_commit] - accumulated by [_pushUndo],
+  /// [undo] and [redo] (see each [_UndoableAction.collectChanges]) and
+  /// handed to [onContentChanged] every time [_commit] fires, then
+  /// cleared - see [_takeAndClearPendingChanges].
+  final PageChangeSet _pendingChanges = PageChangeSet();
+
+  /// Fired with a text box's newly-committed content right after
+  /// [commitTextEdit] saves it (never on every keystroke - only once
+  /// an edit actually finishes). Lets the caller (PageScreen) do
+  /// best-effort follow-up work keyed off the real text - specifically,
+  /// scanning it for local-file links to embed via LocalStore (see
+  /// PageScreen._embedLocalLinksIn) - without this controller needing
+  /// to know anything about links, files, or storage itself.
+  final void Function(String newText)? onTextCommitted;
 
   /// True when this page's notebook can't be edited from this device
   /// right now (owned by the other device, and not currently connected
@@ -95,6 +118,14 @@ class PageEditController extends ChangeNotifier {
       if (el is TextBoxElement && selectedElementIds.contains(el.id)) {
         apply(el);
         changed = true;
+        // No _UndoableAction is pushed for this one (font size/family
+        // changes aren't undoable today) - so unlike every other
+        // mutation in this file, there's no action.collectChanges to
+        // fall back on for telling storage what changed. Mark it here
+        // directly, or this element's new font size/family would never
+        // make it into _pendingChanges and would silently fail to
+        // persist past a restart.
+        _pendingChanges.markPut(el.id);
       }
     }
     if (changed) {
@@ -325,6 +356,97 @@ class PageEditController extends ChangeNotifier {
         case ShapeElement sh:
           sh.rect = sh.rect.shift(delta);
       }
+    }
+  }
+
+  // --- Rotate (drag the handle above a lasso-selected group of ink) -----
+
+  /// The union bounding box of every currently selected element, or null
+  /// if nothing's selected - used to draw one outline/rotate handle
+  /// around a whole selected group, rather than the per-element dashed
+  /// rectangles DraftOverlayPainter already draws for that.
+  Rect? get selectionBounds {
+    Rect? bounds;
+    for (final el in page.elements) {
+      if (!selectedElementIds.contains(el.id)) continue;
+      bounds = bounds == null ? el.bounds : bounds.expandToInclude(el.bounds);
+    }
+    return bounds;
+  }
+
+  /// Whether the current selection can be rotated. Scoped to selections
+  /// made up entirely of [InkStrokeElement]s (see [_applyRotation]):
+  /// images, text boxes and shapes are stored as a plain axis-aligned
+  /// [Rect] with no rotation of their own, so there's nowhere to record
+  /// an arbitrary angle for them without a larger model change (and
+  /// nothing in the app's rendering/hit-testing yet expects a rotated
+  /// one). Ink strokes have no such constraint - they're just a list of
+  /// points, equally valid at any angle - which is also exactly the
+  /// "lasso around some handwriting" case this was asked for.
+  bool get canRotateSelection {
+    if (selectedElementIds.isEmpty) return false;
+    return page.elements.where((e) => selectedElementIds.contains(e.id)).every((e) => e is InkStrokeElement);
+  }
+
+  Offset? _rotatePivot;
+  double? _rotateLastAngle;
+  double _rotateTotalAngle = 0.0;
+
+  /// [canvasPoint] is wherever the rotate handle was actually grabbed,
+  /// but the pivot used for every step of the drag is the selection's
+  /// own bounding-box center - so the very first pixel of movement
+  /// doesn't snap the drawing to point at the cursor, only the angle it
+  /// sweeps through afterward matters.
+  void startRotateSelection(Offset canvasPoint) {
+    if (_readOnly || !canRotateSelection) return;
+    final bounds = selectionBounds;
+    if (bounds == null) return;
+    _rotatePivot = bounds.center;
+    _rotateLastAngle = _angleFrom(bounds.center, canvasPoint);
+    _rotateTotalAngle = 0.0;
+  }
+
+  void updateRotateSelection(Offset canvasPoint) {
+    final pivot = _rotatePivot;
+    final lastAngle = _rotateLastAngle;
+    if (pivot == null || lastAngle == null) return;
+    final angle = _angleFrom(pivot, canvasPoint);
+    final delta = angle - lastAngle;
+    _rotateLastAngle = angle;
+    _rotateTotalAngle += delta;
+    _applyRotation(selectedElementIds, pivot, delta);
+    notifyListeners();
+  }
+
+  void endRotateSelection() {
+    final pivot = _rotatePivot;
+    final totalAngle = _rotateTotalAngle;
+    _rotatePivot = null;
+    _rotateLastAngle = null;
+    _rotateTotalAngle = 0.0;
+    if (pivot == null || totalAngle == 0.0 || selectedElementIds.isEmpty) return;
+    _pushUndo(_RotateElementsAction(Set.of(selectedElementIds), pivot, totalAngle));
+    _commit();
+  }
+
+  double _angleFrom(Offset pivot, Offset point) => math.atan2(point.dy - pivot.dy, point.dx - pivot.dx);
+
+  void _applyRotation(Set<String> ids, Offset pivot, double angle) {
+    final cosA = math.cos(angle);
+    final sinA = math.sin(angle);
+    Offset rotate(Offset p) {
+      final d = p - pivot;
+      return pivot + Offset(d.dx * cosA - d.dy * sinA, d.dx * sinA + d.dy * cosA);
+    }
+
+    for (final el in page.elements) {
+      if (!ids.contains(el.id)) continue;
+      if (el is InkStrokeElement) {
+        for (var i = 0; i < el.points.length; i++) {
+          el.points[i] = rotate(el.points[i]);
+        }
+      }
+      // Other element kinds aren't touched here - see canRotateSelection.
     }
   }
 
@@ -574,6 +696,19 @@ class PageEditController extends ChangeNotifier {
     el.text = newText;
     _pushUndo(_EditTextAction(id, before, newText));
     _commit();
+    onTextCommitted?.call(newText);
+  }
+
+  /// Records that [rawLinkTarget] (the exact text of a detected
+  /// local-file link - see findUrls in link_detection.dart) now has an
+  /// embedded copy named [basename] in LocalStore's images/ folder,
+  /// then persists - see PageScreen._embedLocalLinksIn, which is what
+  /// discovers this and calls here. A no-op if some other edit already
+  /// recorded the exact same mapping first.
+  void recordEmbeddedLink(String rawLinkTarget, String basename) {
+    if (page.embeddedLinks[rawLinkTarget] == basename) return;
+    page.embeddedLinks[rawLinkTarget] = basename;
+    _commit();
   }
 
   /// Cleans up a text box that ended up with nothing in it - placed, then
@@ -682,15 +817,21 @@ class PageEditController extends ChangeNotifier {
 
   // --- Undo/redo ---------------------------------------------------------
 
+  /// Records [action] on the undo stack AND folds in what it just did
+  /// (isUndo: false, since pushing an action always happens right after
+  /// applying it forward for the first time - see every call site) into
+  /// [_pendingChanges], so the upcoming [_commit] reports it.
   void _pushUndo(_UndoableAction action) {
     _undoStack.add(action);
     _redoStack.clear();
+    action.collectChanges(_pendingChanges, isUndo: false);
   }
 
   void undo() {
     if (_readOnly || _undoStack.isEmpty) return;
     final action = _undoStack.removeLast();
     action.undo(this);
+    action.collectChanges(_pendingChanges, isUndo: true);
     _redoStack.add(action);
     _commit();
   }
@@ -699,6 +840,7 @@ class PageEditController extends ChangeNotifier {
     if (_readOnly || _redoStack.isEmpty) return;
     final action = _redoStack.removeLast();
     action.redo(this);
+    action.collectChanges(_pendingChanges, isUndo: false);
     _undoStack.add(action);
     _commit();
   }
@@ -741,7 +883,17 @@ class PageEditController extends ChangeNotifier {
   void _commit() {
     page.touch();
     notifyListeners();
-    onContentChanged?.call();
+    onContentChanged?.call(_takeAndClearPendingChanges());
+  }
+
+  /// Snapshots [_pendingChanges] and clears it for the next gesture -
+  /// same "consume once" shape as LibraryController.consumeSyncedPageUpdate,
+  /// so a change never gets reported to [onContentChanged] twice.
+  PageChangeSet _takeAndClearPendingChanges() {
+    final snapshot = PageChangeSet()..applyNewer(_pendingChanges);
+    _pendingChanges.put.clear();
+    _pendingChanges.deleted.clear();
+    return snapshot;
   }
 }
 
@@ -754,6 +906,13 @@ extension _FirstOrNullX<T> on Iterable<T> {
 abstract class _UndoableAction {
   void undo(PageEditController c);
   void redo(PageEditController c);
+
+  /// Which element ids end up put (added/changed) vs deleted by this
+  /// action when applied in the given direction - isUndo: false means
+  /// "just applied forward" (a first-time apply, or a redo), isUndo:
+  /// true means "just undone". See PageEditController._pushUndo/undo/
+  /// redo, the only callers.
+  void collectChanges(PageChangeSet changes, {required bool isUndo});
 }
 
 class _AddElementsAction extends _UndoableAction {
@@ -769,6 +928,13 @@ class _AddElementsAction extends _UndoableAction {
   @override
   void redo(PageEditController c) {
     c.page.elements.addAll(elements);
+  }
+
+  @override
+  void collectChanges(PageChangeSet changes, {required bool isUndo}) {
+    for (final e in elements) {
+      isUndo ? changes.markDeleted(e.id) : changes.markPut(e.id);
+    }
   }
 }
 
@@ -786,6 +952,13 @@ class _RemoveElementsAction extends _UndoableAction {
     final ids = elements.map((e) => e.id).toSet();
     c.page.elements.removeWhere((e) => ids.contains(e.id));
   }
+
+  @override
+  void collectChanges(PageChangeSet changes, {required bool isUndo}) {
+    for (final e in elements) {
+      isUndo ? changes.markPut(e.id) : changes.markDeleted(e.id);
+    }
+  }
 }
 
 class _MoveElementsAction extends _UndoableAction {
@@ -798,6 +971,35 @@ class _MoveElementsAction extends _UndoableAction {
 
   @override
   void redo(PageEditController c) => c._applyDelta(ids, delta);
+
+  @override
+  void collectChanges(PageChangeSet changes, {required bool isUndo}) {
+    // Same ids exist either way - only their position changed - so
+    // both directions are a put, not a delete.
+    for (final id in ids) {
+      changes.markPut(id);
+    }
+  }
+}
+
+class _RotateElementsAction extends _UndoableAction {
+  _RotateElementsAction(this.ids, this.pivot, this.angle);
+  final Set<String> ids;
+  final Offset pivot;
+  final double angle;
+
+  @override
+  void undo(PageEditController c) => c._applyRotation(ids, pivot, -angle);
+
+  @override
+  void redo(PageEditController c) => c._applyRotation(ids, pivot, angle);
+
+  @override
+  void collectChanges(PageChangeSet changes, {required bool isUndo}) {
+    for (final id in ids) {
+      changes.markPut(id);
+    }
+  }
 }
 
 class _ResizeElementAction extends _UndoableAction {
@@ -817,6 +1019,9 @@ class _ResizeElementAction extends _UndoableAction {
     final el = c._findElement(id);
     if (el != null) c._setElementRect(el, after);
   }
+
+  @override
+  void collectChanges(PageChangeSet changes, {required bool isUndo}) => changes.markPut(id);
 }
 
 class _EditTextAction extends _UndoableAction {
@@ -837,6 +1042,9 @@ class _EditTextAction extends _UndoableAction {
   void redo(PageEditController c) {
     _find(c)?.text = after;
   }
+
+  @override
+  void collectChanges(PageChangeSet changes, {required bool isUndo}) => changes.markPut(id);
 }
 
 /// What [PageEditController.copySelectedImage]/[cutSelectedImage] stash

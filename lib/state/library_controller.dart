@@ -3,10 +3,12 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
 
+import '../models/canvas_element.dart';
 import '../models/notebook.dart';
 import '../models/page.dart';
 import '../models/section.dart';
 import '../storage/local_store.dart';
+import '../storage/page_change_set.dart';
 import '../sync/device_identity.dart';
 import '../sync/sync_engine.dart';
 
@@ -53,6 +55,48 @@ class LibraryController extends ChangeNotifier {
   /// SyncEngine at construction time (SyncEngine itself needs a
   /// LibraryController to be built first).
   SyncEngine? syncEngine;
+
+  // --- Debounced disk saves -------------------------------------------
+  //
+  // See _scheduleSave/_schedulePageSave/flushPendingSave below. Two
+  // things used to make saving expensive: every mutation wrote to disk
+  // immediately (fixed by debouncing - see _saveDebounceTimer), and
+  // every write re-encoded the ENTIRE library, every page's ink
+  // included, even for a single pen stroke on one page (fixed by
+  // LocalStore's manifest+pages format - see its class doc comment -
+  // plus _dirtyPages below, which is what lets a page-scoped edit only
+  // ever touch that one page's own file rather than every page that
+  // happens to exist).
+  Timer? _saveDebounceTimer;
+  bool _saveDirty = false;
+  static const _saveDebounceDelay = Duration(milliseconds: 500);
+
+  /// Pages with a pending, not-yet-flushed content edit (pen strokes,
+  /// mainly), keyed by id so scheduling the same page's save twice in
+  /// one debounce window doesn't queue it twice. Holds the actual
+  /// [NotePage] object (mutated in place elsewhere - see
+  /// StaticContentPainter's doc comment for why that matters) rather
+  /// than just its id, so [flushPendingSave] can read its current
+  /// elements directly without a separate lookup. Cleared (without
+  /// individually flushing each one) whenever a full [_saveDirty] save
+  /// happens instead, since that already covers every page.
+  final Map<String, NotePage> _dirtyPages = {};
+
+  /// Accumulated element-level changes for each page in [_dirtyPages],
+  /// keyed by page id - see [PageChangeSet]. Merged (not overwritten)
+  /// across multiple edits inside one debounce window via
+  /// [PageChangeSet.applyNewer], so a burst of pen strokes ends up
+  /// appending records for every one of them, not just the last.
+  /// Absent (or empty) for a page whose only pending change is metadata
+  /// the manifest already covers (e.g. a background change, or
+  /// PageEditController.recordEmbeddedLink) - see [flushPendingSave].
+  final Map<String, PageChangeSet> _dirtyPageChangeSets = {};
+
+  @override
+  void dispose() {
+    _saveDebounceTimer?.cancel();
+    super.dispose();
+  }
 
   List<Notebook> notebooks = [];
   /// Tombstones for whole notebooks deleted by their owning device -
@@ -101,11 +145,99 @@ class LibraryController extends ChangeNotifier {
   }
 
   Future<void> _persist({String? notebookId}) async {
-    await _store.saveLibrary(notebooks, deletedNotebookIds);
     if (notebookId != null) {
       // Fire-and-forget: propagate the change to any connected peer right
       // away instead of waiting for the next periodic manifest exchange.
+      // Reads straight off the in-memory `notebooks` list, so this is
+      // unaffected by the disk save below being debounced - a connected
+      // peer still sees every edit immediately, only this device's own
+      // disk write is coalesced.
       unawaited(syncEngine?.pushNotebook(notebookId));
+    }
+    _scheduleSave();
+  }
+
+  /// Coalesces rapid-fire saves - one per pen stroke while actively
+  /// drawing is the extreme case - into a single disk write after a
+  /// short pause in editing, instead of paying the full-library
+  /// encode+compress+write cost on every single one. If another edit
+  /// lands before the timer fires, it just resets - so a long burst of
+  /// strokes (or any other rapid edits) ends up doing exactly one write
+  /// shortly after you stop, not one per edit.
+  ///
+  /// This only delays when the write happens, never whether it does -
+  /// [flushPendingSave] is the other half, forcing it to happen right
+  /// now instead of waiting out the timer, for anywhere that needs a
+  /// guarantee the latest edits are actually on disk first (the app
+  /// backgrounding/losing focus - see main.dart's lifecycle observer).
+  void _scheduleSave() {
+    _saveDirty = true;
+    _saveDebounceTimer?.cancel();
+    _saveDebounceTimer = Timer(_saveDebounceDelay, () {
+      unawaited(flushPendingSave());
+    });
+  }
+
+  /// The fast path for a page-content edit (a pen stroke, mainly):
+  /// schedules just [page]'s own file to be rewritten, plus the (much
+  /// cheaper, ink-free) manifest, instead of going through
+  /// [_scheduleSave]'s full-library rewrite - see LocalStore's
+  /// saveManifest/savePageFile for why that's the whole point. Shares
+  /// the same debounce timer as [_scheduleSave]: whichever one last
+  /// scheduled something is what the timer waits out, and
+  /// [flushPendingSave] below handles either kind (or both at once)
+  /// correctly regardless of which fired it.
+  void _schedulePageSave(NotePage page, PageChangeSet? changes) {
+    _dirtyPages[page.id] = page;
+    if (changes != null && !changes.isEmpty) {
+      final existing = _dirtyPageChangeSets[page.id];
+      if (existing == null) {
+        _dirtyPageChangeSets[page.id] = PageChangeSet()..applyNewer(changes);
+      } else {
+        existing.applyNewer(changes);
+      }
+    }
+    _saveDebounceTimer?.cancel();
+    _saveDebounceTimer = Timer(_saveDebounceDelay, () {
+      unawaited(flushPendingSave());
+    });
+  }
+
+  /// Writes out whatever [_scheduleSave]/[_schedulePageSave] left
+  /// pending, right now, rather than waiting for the timer - a no-op
+  /// if nothing's pending. Safe to call as often as needed; only
+  /// actually touches disk when there's something to flush.
+  ///
+  /// A pending full save (from [_scheduleSave]) always wins over and
+  /// clears any pending page-only saves, since saveLibrary() already
+  /// rewrites every page's file anyway - there's nothing left for the
+  /// page-scoped saves to add once that's happened.
+  Future<void> flushPendingSave() async {
+    _saveDebounceTimer?.cancel();
+    _saveDebounceTimer = null;
+    if (_saveDirty) {
+      _saveDirty = false;
+      _dirtyPages.clear();
+      _dirtyPageChangeSets.clear();
+      await _store.saveLibrary(notebooks, deletedNotebookIds);
+      return;
+    }
+    if (_dirtyPages.isEmpty) return;
+    final pages = _dirtyPages.values.toList(growable: false);
+    final changeSets = Map<String, PageChangeSet>.of(_dirtyPageChangeSets);
+    _dirtyPages.clear();
+    _dirtyPageChangeSets.clear();
+    await _store.saveManifest(notebooks, deletedNotebookIds);
+    for (final page in pages) {
+      final changes = changeSets[page.id];
+      if (changes == null || changes.isEmpty) {
+        // Nothing at the element level changed for this page - just a
+        // metadata edit the manifest above already covers (a
+        // background change, or PageEditController.recordEmbeddedLink).
+        // No page-file work needed at all.
+        continue;
+      }
+      await _store.appendPageChanges(page.id, page.elements, changes);
     }
   }
 
@@ -128,11 +260,26 @@ class LibraryController extends ChangeNotifier {
 
   /// Deleting a whole notebook is stricter than editing it: only the
   /// device that owns it may delete it, connected or not (see
-  /// NotYourNotebookException). UI code (the notebook grid) uses this
-  /// to decide whether to even offer the delete affordance at all.
+  /// NotYourNotebookException) - UNLESS the owning device's identity no
+  /// longer exists anywhere we'd recognize it (e.g. that device's app
+  /// data was wiped/reinstalled and it now has a fresh id). In that case
+  /// the notebook would otherwise be permanently undeletable by anyone,
+  /// since no device's [identity.id] can ever match the dead owner id
+  /// again. We treat "no longer trusted" as the signal for "gone", as
+  /// opposed to merely offline right now (which keeps it in the trusted
+  /// list and should NOT unlock deletion). UI code (the notebook grid)
+  /// uses this to decide whether to even offer the delete affordance.
   bool canDeleteNotebook(String notebookId) {
     final notebook = notebooks.where((n) => n.id == notebookId).firstOrNull;
-    return notebook != null && notebook.isOwnedBy(identity.id);
+    if (notebook == null) return false;
+    if (notebook.isOwnedBy(identity.id)) return true;
+    final ownerId = notebook.ownerDeviceId;
+    if (ownerId != null &&
+        syncEngine != null &&
+        !syncEngine!.pairingStore.isTrusted(ownerId)) {
+      return true;
+    }
+    return false;
   }
 
   /// Called by [SyncEngine] when a notebook arrives from a peer. Merges
@@ -159,8 +306,11 @@ class LibraryController extends ChangeNotifier {
       // preserve; just add it as-is.
       notebooks.add(incoming);
     } else {
-      _mergeNotebookInPlace(notebooks[index], incoming);
+      final removedPages = _mergeNotebookInPlace(notebooks[index], incoming);
       _dropSelectionOfAnythingJustRemoved(notebooks[index]);
+      for (final page in removedPages) {
+        await _deleteImagesOnPage(page);
+      }
     }
     await _store.saveLibrary(notebooks, deletedNotebookIds);
     notifyListeners();
@@ -181,14 +331,21 @@ class LibraryController extends ChangeNotifier {
       return; // already recorded this deletion (or a newer one) - nothing to do
     }
     deletedNotebookIds[notebookId] = deletedAt;
-    final hadIt = notebooks.any((n) => n.id == notebookId);
+    final removedNotebook = notebooks.where((n) => n.id == notebookId).firstOrNull;
     notebooks.removeWhere((n) => n.id == notebookId);
-    if (hadIt && selectedNotebookId == notebookId) goHome();
+    if (removedNotebook != null && selectedNotebookId == notebookId) goHome();
     await _store.saveLibrary(notebooks, deletedNotebookIds);
+    if (removedNotebook != null) await _deleteImagesInNotebook(removedNotebook);
     notifyListeners();
   }
 
-  void _mergeNotebookInPlace(Notebook local, Notebook incoming) {
+  /// Merges [incoming] into [local] in place. Returns every [NotePage]
+  /// this merge just removed locally - a section or page tombstone
+  /// taking effect - so [applySyncedNotebook] can clean up their image
+  /// files afterward; this method stays synchronous (deleting files
+  /// is not) and leaves that part to the caller.
+  List<NotePage> _mergeNotebookInPlace(Notebook local, Notebook incoming) {
+    final removedPages = <NotePage>[];
     local.title = incoming.title;
     local.color = incoming.color;
     local.ownerDeviceId = incoming.ownerDeviceId;
@@ -212,15 +369,21 @@ class LibraryController extends ChangeNotifier {
         local.deletedPageIds[entry.key] = entry.value;
       }
     }
-    local.sections.removeWhere((section) {
+    final removedSections = local.sections.where((section) {
       final deletedAt = local.deletedSectionIds[section.id];
       return deletedAt != null && !_sectionActivity(section).isAfter(deletedAt);
-    });
+    }).toList();
+    for (final section in removedSections) {
+      removedPages.addAll(section.pages);
+    }
+    local.sections.removeWhere(removedSections.contains);
     for (final section in local.sections) {
-      section.pages.removeWhere((page) {
+      final removedFromThisSection = section.pages.where((page) {
         final deletedAt = local.deletedPageIds[page.id];
         return deletedAt != null && !page.lastModified.isAfter(deletedAt);
-      });
+      }).toList();
+      removedPages.addAll(removedFromThisSection);
+      section.pages.removeWhere(removedFromThisSection.contains);
     }
 
     // --- Then merge in whatever the peer has that we don't, or that's
@@ -258,6 +421,113 @@ class LibraryController extends ChangeNotifier {
           ..addAll(incomingPage.elements);
         _syncedPageIds.add(localPage.id);
       }
+    }
+    return removedPages;
+  }
+
+  // --- Local image file cleanup ---------------------------------------
+
+  /// True if some [ImageElement] still in the library points at
+  /// [filePath]. Since [LocalStore.importImageBytes] names each image
+  /// file after a hash of its bytes, two unrelated elements that happen
+  /// to hold byte-for-byte identical images (e.g. the same picture
+  /// inserted on two different pages, or re-inserted after being
+  /// deleted once already) can end up sharing the exact same file on
+  /// disk - so before deleting a file, every call site below has
+  /// already removed the page/section/notebook that used to reference
+  /// it from [notebooks], and this checks whether anything ELSE still
+  /// does.
+  bool _imagePathStillReferenced(String filePath) {
+    for (final notebook in notebooks) {
+      for (final section in notebook.sections) {
+        for (final page in section.pages) {
+          for (final element in page.elements) {
+            if (element is ImageElement && element.filePath == filePath) return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  /// Deletes [filePath] from local storage, unless [_imagePathStillReferenced]
+  /// says some other, still-live element needs it. Best-effort either
+  /// way: see LocalStore.deleteImageFile.
+  Future<void> _deleteImageIfUnreferenced(String filePath) async {
+    if (_imagePathStillReferenced(filePath)) return;
+    await _store.deleteImageFile(filePath);
+  }
+
+  /// Same idea as [_imagePathStillReferenced], for an embedded local-file
+  /// link's basename (NotePage.embeddedLinks values) rather than an
+  /// ImageElement's full path.
+  bool _embeddedLinkFileStillReferenced(String basename) {
+    for (final notebook in notebooks) {
+      for (final section in notebook.sections) {
+        for (final page in section.pages) {
+          if (page.embeddedLinks.values.contains(basename)) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /// Deletes an embedded-link file (see NotePage.embeddedLinks) from
+  /// local storage, unless [_embeddedLinkFileStillReferenced] says some
+  /// other, still-live page needs it. [basename] is resolved against
+  /// LocalStore's images/ folder (the same folder importLinkedFile
+  /// wrote it into) before deleting, since embeddedLinks only stores a
+  /// basename, not a full path.
+  Future<void> _deleteEmbeddedLinkFileIfUnreferenced(String basename) async {
+    if (_embeddedLinkFileStillReferenced(basename)) return;
+    final imagesDir = await _store.imagesDirectory();
+    await _store.deleteImageFile('${imagesDir.path}/$basename');
+  }
+
+  /// Deletes every image file [page]'s elements point at from local
+  /// storage (skipping any still referenced elsewhere - see
+  /// [_deleteImageIfUnreferenced]). Called wherever a page stops
+  /// existing on THIS device - deleted directly ([deletePage]), inside
+  /// a deleted section or notebook, or removed here because a peer's
+  /// tombstone says it was deleted on the device that owns it - so that
+  /// inserting an image and later deleting the page it's on doesn't
+  /// just leak the file on disk forever.
+  ///
+  /// Does NOT (yet) cover a page whose *content* gets overwritten by a
+  /// fresher synced copy that simply no longer includes some image
+  /// (see the elements..clear()..addAll(...) below) - that image is
+  /// still an orphan on disk afterward. Worth revisiting, but it's a
+  /// different problem (general unreferenced-image garbage collection)
+  /// from "the note that owned this image was deleted", which is what
+  /// this is scoped to for now.
+  Future<void> _deleteImagesOnPage(NotePage page) async {
+    for (final element in page.elements) {
+      if (element is ImageElement) {
+        await _deleteImageIfUnreferenced(element.filePath);
+      }
+    }
+    for (final basename in page.embeddedLinks.values) {
+      await _deleteEmbeddedLinkFileIfUnreferenced(basename);
+    }
+    // The page's own pages/<id>.dat file (see LocalStore's format doc
+    // comment) is just as much this page's data as its images are -
+    // same reasoning, same place, so it doesn't leak on disk forever
+    // either. Also drop any not-yet-flushed save for it - nothing left
+    // to write once the page itself is gone.
+    _dirtyPages.remove(page.id);
+    _dirtyPageChangeSets.remove(page.id);
+    await _store.deletePageFile(page.id);
+  }
+
+  Future<void> _deleteImagesInSection(NoteSection section) async {
+    for (final page in section.pages) {
+      await _deleteImagesOnPage(page);
+    }
+  }
+
+  Future<void> _deleteImagesInNotebook(Notebook notebook) async {
+    for (final section in notebook.sections) {
+      await _deleteImagesInSection(section);
     }
   }
 
@@ -365,6 +635,7 @@ class LibraryController extends ChangeNotifier {
 
   Future<void> deleteNotebook(String notebookId) async {
     if (!canDeleteNotebook(notebookId)) throw NotYourNotebookException(notebookId);
+    final removedNotebook = notebooks.where((n) => n.id == notebookId).firstOrNull;
     final deletedAt = DateTime.now();
     deletedNotebookIds[notebookId] = deletedAt;
     notebooks.removeWhere((n) => n.id == notebookId);
@@ -374,6 +645,7 @@ class LibraryController extends ChangeNotifier {
     // waiting for the next periodic manifest exchange - same idea as
     // _persist()'s pushNotebook, just the deletion equivalent.
     unawaited(syncEngine?.pushNotebookDeletion(notebookId, deletedAt));
+    if (removedNotebook != null) await _deleteImagesInNotebook(removedNotebook);
     notifyListeners();
   }
 
@@ -401,6 +673,7 @@ class LibraryController extends ChangeNotifier {
   Future<void> deleteSection(String notebookId, String sectionId) async {
     _assertEditable(notebookId);
     final notebook = selectedNotebookOrThrow(notebookId);
+    final removedSection = notebook.sections.where((s) => s.id == sectionId).firstOrNull;
     notebook.deletedSectionIds[sectionId] = DateTime.now();
     notebook.sections.removeWhere((s) => s.id == sectionId);
     notebook.touch();
@@ -408,6 +681,7 @@ class LibraryController extends ChangeNotifier {
       selectedSectionId = notebook.sections.isNotEmpty ? notebook.sections.first.id : null;
       selectedPageId = null;
     }
+    if (removedSection != null) await _deleteImagesInSection(removedSection);
     await _persist(notebookId: notebookId);
     notifyListeners();
   }
@@ -435,12 +709,14 @@ class LibraryController extends ChangeNotifier {
     _assertEditable(notebookId);
     final notebook = selectedNotebookOrThrow(notebookId);
     final section = _findSection(notebookId, sectionId);
+    final removedPage = section.pages.where((p) => p.id == pageId).firstOrNull;
     notebook.deletedPageIds[pageId] = DateTime.now();
     section.pages.removeWhere((p) => p.id == pageId);
     notebook.touch();
     if (selectedPageId == pageId) {
       selectedPageId = section.pages.isNotEmpty ? section.pages.first.id : null;
     }
+    if (removedPage != null) await _deleteImagesOnPage(removedPage);
     await _persist(notebookId: notebookId);
     notifyListeners();
   }
@@ -455,14 +731,44 @@ class LibraryController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Reorders a page within its section: removes it from [oldIndex] and
+  /// reinserts it at [newIndex], using the same index semantics as
+  /// [ReorderableListView]'s onReorder callback (newIndex is where the
+  /// item would land if inserted *before* being removed from oldIndex,
+  /// so a downward move needs one subtracted off to land in the right
+  /// slot afterward - the standard adjustment that callback always
+  /// needs).
+  ///
+  /// Purely a local reorder of the in-memory list: page order isn't
+  /// itself synced between devices today (_mergeNotebookInPlace only
+  /// ever updates existing pages in place and never touches list
+  /// position), so each device's page order stays independent until
+  /// sync gains an explicit ordering field.
+  Future<void> reorderPage(String notebookId, String sectionId, int oldIndex, int newIndex) async {
+    _assertEditable(notebookId);
+    final section = _findSection(notebookId, sectionId);
+    if (oldIndex < 0 || oldIndex >= section.pages.length) return;
+    final adjustedNewIndex = newIndex > oldIndex ? newIndex - 1 : newIndex;
+    final page = section.pages.removeAt(oldIndex);
+    section.pages.insert(adjustedNewIndex.clamp(0, section.pages.length), page);
+    selectedNotebookOrThrow(notebookId).touch();
+    await _persist(notebookId: notebookId);
+    notifyListeners();
+  }
+
   /// Called by the canvas controller after any edit to a page's elements.
   /// The canvas controller owns the live edit session; this just persists
   /// the result and marks the page as modified.
-  Future<void> persistPageEdit(String notebookId, String sectionId, String pageId) async {
+  Future<void> persistPageEdit(String notebookId, String sectionId, String pageId, {PageChangeSet? changes}) async {
     _assertEditable(notebookId);
-    _findPage(notebookId, sectionId, pageId).touch();
+    final page = _findPage(notebookId, sectionId, pageId);
+    page.touch();
     selectedNotebookOrThrow(notebookId).touch();
-    await _persist(notebookId: notebookId);
+    // Same immediate fire-and-forget push _persist() does for other
+    // mutations - reads straight off the in-memory model, so it's
+    // unaffected by the page-scoped disk save below being debounced.
+    unawaited(syncEngine?.pushNotebook(notebookId));
+    _schedulePageSave(page, changes);
     // No notifyListeners() here on purpose: the canvas widget already
     // rebuilds itself from its own controller on every stroke, and
     // rebuilding the whole navigation tree on every pen movement would be

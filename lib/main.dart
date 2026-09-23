@@ -5,6 +5,7 @@ import 'package:flutter/widgets.dart';
 import 'package:provider/provider.dart';
 
 import 'app_theme.dart';
+import 'state/app_settings.dart';
 import 'state/library_controller.dart';
 import 'storage/local_store.dart';
 import 'sync/device_identity.dart';
@@ -31,6 +32,7 @@ Future<void> main() async {
   final appDir = await store.appDirectory();
   final identity = await DeviceIdentity.load(appDir);
   final pairingStore = await PairingStore.load(appDir);
+  final settings = await AppSettings.load(appDir);
 
   final library = LibraryController(store, identity);
   final syncEngine = SyncEngine(
@@ -49,7 +51,7 @@ Future<void> main() async {
 
   await minSplashDuration;
 
-  runApp(InkCanvasApp(library: library, syncEngine: syncEngine));
+  runApp(InkCanvasApp(library: library, syncEngine: syncEngine, settings: settings));
 }
 
 /// What `runApp` shows for the very first frame, before the real
@@ -69,10 +71,11 @@ class _BootSplash extends StatelessWidget {
 }
 
 class InkCanvasApp extends StatelessWidget {
-  const InkCanvasApp({super.key, required this.library, required this.syncEngine});
+  const InkCanvasApp({super.key, required this.library, required this.syncEngine, required this.settings});
 
   final LibraryController library;
   final SyncEngine syncEngine;
+  final AppSettings settings;
 
   @override
   Widget build(BuildContext context) {
@@ -80,6 +83,7 @@ class InkCanvasApp extends StatelessWidget {
       providers: [
         ChangeNotifierProvider<LibraryController>.value(value: library),
         ChangeNotifierProvider<SyncEngine>.value(value: syncEngine),
+        ChangeNotifierProvider<AppSettings>.value(value: settings),
       ],
       child: MaterialApp(
         title: 'InkCanvas',
@@ -125,6 +129,7 @@ class _PairingApprovalGate extends StatefulWidget {
 
 class _PairingApprovalGateState extends State<_PairingApprovalGate> with WidgetsBindingObserver {
   late final SyncEngine _syncEngine;
+  late final LibraryController _library;
   bool _dialogShowing = false;
 
   // Only a genuine sleep/background cycle passes through `paused` before
@@ -139,6 +144,7 @@ class _PairingApprovalGateState extends State<_PairingApprovalGate> with Widgets
   void initState() {
     super.initState();
     _syncEngine = context.read<SyncEngine>();
+    _library = context.read<LibraryController>();
     _syncEngine.addListener(_onSyncChanged);
     WidgetsBinding.instance.addObserver(this);
   }
@@ -152,6 +158,19 @@ class _PairingApprovalGateState extends State<_PairingApprovalGate> with Widgets
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) {
+      // Any transition away from being the active, focused app - going
+      // to the background, losing focus, the window closing - forces
+      // LibraryController's debounced save (see its _scheduleSave doc
+      // comment) to actually happen right now instead of possibly still
+      // sitting in its short debounce window. Most important on
+      // Android, where the OS can kill a backgrounded process at any
+      // time with no further warning - a write still waiting on its
+      // timer at that point would just be lost. flushPendingSave() is a
+      // no-op if nothing's pending, so calling it on every non-resumed
+      // transition (there can be more than one in a row) is harmless.
+      unawaited(_library.flushPendingSave());
+    }
     if (state == AppLifecycleState.paused) {
       _wasPaused = true;
       return;

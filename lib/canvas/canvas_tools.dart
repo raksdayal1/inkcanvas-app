@@ -19,6 +19,19 @@ enum CanvasTool {
 /// moves.
 enum ResizeHandle { topLeft, topRight, bottomLeft, bottomRight, top, bottom, left, right }
 
+/// How far above a selection's bounding box (in constant screen-space
+/// pixels, like the resize handles, so it doesn't shrink to nothing
+/// when zoomed out) the rotate handle floats - see
+/// PageEditController.canRotateSelection and DraftOverlayPainter's
+/// selection-drawing code. Shared between the painter (draws it here)
+/// and the canvas widget (hit-tests it here) so the two can't drift
+/// apart.
+const double kRotateHandleOffset = 28.0;
+
+/// Hit-test radius around the rotate handle's drawn position, in the
+/// same constant screen-space pixels as [kRotateHandleOffset].
+const double kRotateHandleHitRadius = 18.0;
+
 /// Font choices offered for text boxes: a display label mapped to a
 /// Google Fonts family name (via the google_fonts package, so the same
 /// font actually renders the same way on both Windows and Android

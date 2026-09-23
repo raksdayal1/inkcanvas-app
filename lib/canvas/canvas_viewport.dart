@@ -22,8 +22,15 @@ class CanvasViewport {
 
   double scale;
 
-  static const double minScale = 0.05;
-  static const double maxScale = 12.0;
+  // Zoom range, tightened to 25%-200% (was 5%-1200%, then 20%-1200%) -
+  // OneNote-style zoom limits. The zoom-out side also keeps a lid on
+  // how much of a busy page can ever be on-screen (and therefore need
+  // painting) at once - see StaticContentPainter.paint()'s viewport
+  // culling, which this complements: culling only helps once *some* of
+  // the page is off-screen, and a wide-open zoom-out range could always
+  // just show everything anyway.
+  static const double minScale = 0.25;
+  static const double maxScale = 2.0;
 
   /// How much blank canvas-space margin is allowed to show above/left of
   /// the page's (0, 0) origin - a small breathing margin around the

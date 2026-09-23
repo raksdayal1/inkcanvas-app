@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 
 import '../../canvas/canvas_tools.dart';
 import '../../canvas/page_edit_controller.dart';
 import '../../models/canvas_element.dart';
+import '../../state/app_settings.dart';
 import 'color_palette.dart';
 
 /// The floating tool strip alongside the canvas: tool selection, color,
@@ -36,6 +38,8 @@ class CanvasToolbar extends StatelessWidget {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                _collapseButton(context),
+                const Divider(height: 12),
                 _toolButton(context, CanvasTool.pen, Icons.edit, 'Pen'),
                 _toolButton(context, CanvasTool.highlighter, Icons.brush, 'Highlighter'),
                 _toolButton(context, CanvasTool.eraser, Icons.auto_fix_normal, 'Eraser'),
@@ -47,6 +51,7 @@ class CanvasToolbar extends StatelessWidget {
                 const Divider(height: 12),
                 _colorButton(context),
                 _strokeWidthButton(context),
+                _smoothingToggle(context),
                 const Divider(height: 12),
                 IconButton(
                   icon: const Icon(Icons.image_outlined),
@@ -74,6 +79,39 @@ class CanvasToolbar extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+
+  /// Collapses the toolbar down to a small edge handle (see
+  /// [CollapsedToolbarHandle]) - mainly for tablets, where this floating
+  /// strip would otherwise sit right on the part of the page people
+  /// naturally start writing on. The toolbar itself now docks to the
+  /// right edge (see page_screen.dart), so this collapses it off to the
+  /// right - chevron_right points the way it goes.
+  Widget _collapseButton(BuildContext context) {
+    return IconButton(
+      tooltip: 'Collapse toolbar',
+      icon: const Icon(Icons.chevron_right),
+      onPressed: () => context.read<AppSettings>().setToolbarCollapsed(true),
+    );
+  }
+
+  /// Toggles AppSettings.inkSmoothingEnabled - whether pen/highlighter
+  /// strokes get curve-smoothed at paint time (see
+  /// canvas_painter.dart's _buildStrokePath). Grouped with color/stroke width
+  /// above since it's the same kind of thing: a choice about how the ink
+  /// itself looks, not which tool is active.
+  Widget _smoothingToggle(BuildContext context) {
+    final settings = context.watch<AppSettings>();
+    final enabled = settings.inkSmoothingEnabled;
+    return IconButton(
+      tooltip: enabled ? 'Smooth handwriting: On' : 'Smooth handwriting: Off',
+      icon: const Icon(Icons.auto_fix_high),
+      color: enabled ? Theme.of(context).colorScheme.primary : null,
+      style: enabled
+          ? IconButton.styleFrom(backgroundColor: Theme.of(context).colorScheme.primary.withValues(alpha: 0.12))
+          : null,
+      onPressed: () => settings.setInkSmoothingEnabled(!enabled),
     );
   }
 
@@ -195,4 +233,31 @@ class CanvasToolbar extends StatelessWidget {
     );
   }
 
+}
+
+/// What page_screen.dart shows instead of [CanvasToolbar] while
+/// AppSettings.toolbarCollapsed is true - a slim, easy-to-hit tab
+/// anchored at the same edge the full toolbar would otherwise occupy,
+/// so there's always something visible to tap to bring it back.
+class CollapsedToolbarHandle extends StatelessWidget {
+  const CollapsedToolbarHandle({super.key, required this.onExpand});
+
+  final VoidCallback onExpand;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      elevation: 4,
+      margin: EdgeInsets.zero,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(8))),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: onExpand,
+        child: const Padding(
+          padding: EdgeInsets.symmetric(vertical: 10, horizontal: 4),
+          child: Icon(Icons.chevron_left),
+        ),
+      ),
+    );
+  }
 }

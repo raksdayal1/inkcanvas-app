@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../app_theme.dart';
 import '../models/notebook.dart';
+import '../models/page.dart';
 import '../models/section.dart';
 import '../state/library_controller.dart';
 import '../sync/sync_engine.dart';
@@ -249,35 +252,67 @@ class _PageList extends StatelessWidget {
         ),
         const Divider(height: 1),
         Expanded(
-          child: ListView.builder(
-            itemCount: section.pages.length,
-            itemBuilder: (context, index) {
-              final page = section.pages[index];
-              final selected = page.id == library.selectedPageId;
-              return ListTile(
-                dense: true,
-                selected: selected,
-                leading: const Icon(Icons.description_outlined),
-                title: Text(page.title, maxLines: 1, overflow: TextOverflow.ellipsis),
-                // A visible delete button, not just the long-press menu -
-                // long-press isn't a discoverable gesture with a mouse.
-                trailing: readOnly
-                    ? null
-                    : IconButton(
-                      icon: const Icon(Icons.delete_outline, size: 20),
-                      tooltip: 'Delete page',
-                      onPressed: () => library.deletePage(notebook.id, section.id, page.id),
-                      ),
-                onTap: () {
-                  library.openPage(page.id);
-                  if (Scaffold.of(context).isDrawerOpen) Navigator.pop(context);
-                },
-                onLongPress: readOnly ? null : () => _pageMenu(context, page.id, page.title),
-              );
-            },
-          ),
+          // Read-only notebooks can't be reordered either (there's
+          // nowhere to persist the change to), so they keep the plain
+          // non-reorderable list.
+          child: readOnly
+              ? ListView.builder(
+                  itemCount: section.pages.length,
+                  itemBuilder: (context, index) => _pageTile(context, section.pages[index]),
+                )
+              : ReorderableListView.builder(
+                  itemCount: section.pages.length,
+                  // We supply our own long-press-anywhere-on-the-tile
+                  // drag start below via ReorderableDelayedDragStartListener,
+                  // instead of the default handle Flutter would otherwise
+                  // stack on the trailing edge on desktop - that would sit
+                  // right on top of the "more options" button below.
+                  buildDefaultDragHandles: false,
+                  onReorder: (oldIndex, newIndex) {
+                    unawaited(library.reorderPage(notebook.id, section.id, oldIndex, newIndex));
+                  },
+                  itemBuilder: (context, index) {
+                    final page = section.pages[index];
+                    return ReorderableDelayedDragStartListener(
+                      key: ValueKey(page.id),
+                      index: index,
+                      child: _pageTile(context, page),
+                    );
+                  },
+                ),
         ),
       ],
+      ),
+    );
+  }
+
+  // Rename/delete live in the _pageMenu popup (reached below), not a
+  // permanently-visible trailing button next to the icon - so the row
+  // still reads as just a name plus the "more options" button. Holding
+  // down anywhere else on the tile is reserved for drag-to-reorder (see
+  // the ReorderableDelayedDragStartListener wrapping this in build()),
+  // so unlike before, long-press no longer opens this menu - right-click
+  // (mouse) still does, alongside the button.
+  Widget _pageTile(BuildContext context, NotePage page) {
+    final selected = page.id == library.selectedPageId;
+    return GestureDetector(
+      onSecondaryTap: readOnly ? null : () => _pageMenu(context, page.id, page.title),
+      child: ListTile(
+        dense: true,
+        selected: selected,
+        leading: const Icon(Icons.description_outlined),
+        title: Text(page.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+        trailing: readOnly
+            ? null
+            : IconButton(
+                icon: const Icon(Icons.more_vert),
+                tooltip: 'Page options',
+                onPressed: () => _pageMenu(context, page.id, page.title),
+              ),
+        onTap: () {
+          library.openPage(page.id);
+          if (Scaffold.of(context).isDrawerOpen) Navigator.pop(context);
+        },
       ),
     );
   }

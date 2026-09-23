@@ -1,4 +1,4 @@
-import 'dart:io' show Platform;
+import 'dart:io' show File, Platform;
 import 'dart:typed_data' show Uint8List;
 import 'dart:ui' as ui;
 
@@ -12,9 +12,11 @@ import 'package:provider/provider.dart';
 import '../canvas/canvas_tools.dart';
 import '../canvas/canvas_view_controller.dart';
 import '../canvas/infinite_canvas.dart';
+import '../canvas/link_detection.dart';
 import '../canvas/page_edit_controller.dart';
 import '../models/canvas_element.dart';
 import '../models/page.dart';
+import '../state/app_settings.dart';
 import '../state/library_controller.dart';
 import '../storage/local_store.dart';
 import '../sync/sync_engine.dart';
@@ -62,7 +64,9 @@ class _PageScreenState extends State<PageScreen> {
     final library = context.read<LibraryController>();
     _editController = PageEditController(
       widget.page,
-      onContentChanged: () => library.persistPageEdit(widget.notebookId, widget.sectionId, widget.page.id),
+      onContentChanged: (changes) =>
+          library.persistPageEdit(widget.notebookId, widget.sectionId, widget.page.id, changes: changes),
+      onTextCommitted: _embedLocalLinksIn,
     );
     _viewController = CanvasViewController();
     _titleController = TextEditingController(text: widget.page.title);
@@ -209,22 +213,41 @@ class _PageScreenState extends State<PageScreen> {
                           editController: _editController,
                           viewController: _viewController,
                           onRequestPasteAt: _pasteAt,
+                          resolveEmbeddedLink: _resolveEmbeddedFilePath,
                         ),
                       ),
                       Positioned(
-                        left: 8,
+                        right: 8,
                         top: 8,
                         bottom: 8 + bottomInset,
-                        child: IgnorePointer(
-                          ignoring: readOnly,
-                          child: Opacity(
-                            opacity: readOnly ? 0.4 : 1.0,
-                            child: CanvasToolbar(editController: _editController, onInsertImage: _pickAndInsertImage),
-                          ),
-                        ),
+                        // Collapsed to a slim edge handle (see
+                        // CollapsedToolbarHandle) frees up the strip of
+                        // page along the right edge the full toolbar
+                        // would otherwise sit on top of - moved here
+                        // (from the left) so writing on the left side
+                        // of the page - where it tends to start - has
+                        // the toolbar out of the way without needing to
+                        // collapse it. context.watch here (not just
+                        // inside the toolbar) because collapsing swaps
+                        // out the whole widget, not just something
+                        // inside it.
+                        child: context.watch<AppSettings>().toolbarCollapsed
+                            ? CollapsedToolbarHandle(
+                                onExpand: () => context.read<AppSettings>().setToolbarCollapsed(false),
+                              )
+                            : IgnorePointer(
+                                ignoring: readOnly,
+                                child: Opacity(
+                                  opacity: readOnly ? 0.4 : 1.0,
+                                  child: CanvasToolbar(
+                                    editController: _editController,
+                                    onInsertImage: _pickAndInsertImage,
+                                  ),
+                                ),
+                              ),
                       ),
                       Positioned(
-                        right: 12,
+                        left: 12,
                         bottom: 12 + bottomInset,
                         child: _ZoomControls(viewController: _viewController),
                       ),
@@ -405,13 +428,60 @@ class _PageScreenState extends State<PageScreen> {
       return KeyEventResult.handled;
     }
     if (!Platform.isWindows) return KeyEventResult.ignored;
+    // node.hasPrimaryFocus (see the comment above) is what actually
+    // makes good on this method's doc comment - without it, this was
+    // stealing every Ctrl+V, including ones meant for a text box's own
+    // paste (e.g. pasting a copied link/path into a note), before the
+    // TextField ever saw the keystroke: this handler found no image on
+    // the clipboard for plain text, did nothing, and returned handled
+    // anyway, silently swallowing the paste.
     if (event is KeyDownEvent &&
         event.logicalKey == LogicalKeyboardKey.keyV &&
-        HardwareKeyboard.instance.isControlPressed) {
+        HardwareKeyboard.instance.isControlPressed &&
+        node.hasPrimaryFocus) {
       _pasteAt(_viewController.canvasCenter);
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
+  }
+
+  /// Scans a text box's just-committed content (see
+  /// PageEditController.onTextCommitted) for local-file links (findUrls,
+  /// LinkKind.localFile) this device hasn't already embedded for this
+  /// page, and - if the referenced file actually exists right here right
+  /// now - copies it into local storage via the same content-hash dedup
+  /// LocalStore already uses for images (LocalStore.importLinkedFile),
+  /// then records the mapping on the page (PageEditController.
+  /// recordEmbeddedLink) so the note can still open it later from a
+  /// *different* device, where the original path (often a Windows-only
+  /// "C:\..." one) doesn't exist at all - see NotePage.embeddedLinks.
+  /// Best-effort and silent: a path that doesn't resolve on this device
+  /// (typed by hand, or simply unreachable) is just left as a plain,
+  /// path-only link, exactly as before this existed.
+  Future<void> _embedLocalLinksIn(String newText) async {
+    final localLinks = findUrls(newText).where((u) => u.kind == LinkKind.localFile);
+    for (final link in localLinks) {
+      if (widget.page.embeddedLinks.containsKey(link.target)) continue;
+      final basename = await _localStore.importLinkedFile(resolveLocalFilePath(link.target));
+      if (basename != null && mounted) {
+        _editController.recordEmbeddedLink(link.target, basename);
+      }
+    }
+  }
+
+  /// Given a tapped local-file link's raw target text, returns the path
+  /// of an embedded copy of it on this device (see
+  /// [_embedLocalLinksIn]/NotePage.embeddedLinks), if one is on record
+  /// for this page AND actually present in local storage right now - or
+  /// null if there's no embedded copy (an old link, or one that's never
+  /// resolved on any device), in which case InfiniteCanvas falls back to
+  /// the raw target itself, exactly as before embedding existed.
+  Future<String?> _resolveEmbeddedFilePath(String rawTarget) async {
+    final basename = widget.page.embeddedLinks[rawTarget];
+    if (basename == null) return null;
+    final imagesDir = await _localStore.imagesDirectory();
+    final embeddedPath = '${imagesDir.path}/$basename';
+    return await File(embeddedPath).exists() ? embeddedPath : null;
   }
 
   /// Pastes an image at [canvasPoint] - used by both Ctrl+V (pastes at

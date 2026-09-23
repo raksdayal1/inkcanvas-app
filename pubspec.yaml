@@ -37,6 +37,26 @@ dependencies:
   # DeviceIdentity._defaultName()
   device_info_plus: ^13.2.0
 
+  # Content-hashes imported image bytes so re-inserting the exact same
+  # picture reuses the file already on disk instead of writing another
+  # copy (see LocalStore.importImageBytes) - already pulled in
+  # transitively by other packages, declared directly since our own
+  # code now imports it.
+  crypto: ^3.0.3
+
+  # Opens a tapped hyperlink (auto-detected in note text - see
+  # lib/canvas/link_detection.dart) in the system browser/app on
+  # Windows and Android.
+  url_launcher: ^6.3.0
+
+  # Opens a tapped LOCAL file reference (a "file://" link, or a plain
+  # Windows/UNC/POSIX path someone typed - see lib/canvas/link_detection.dart)
+  # with whatever app the OS has for it. url_launcher can't do this
+  # reliably on Android - it throws FileUriExposedException handing a
+  # bare file:// URI to another app via an intent - this package
+  # routes it through a FileProvider/content:// URI instead.
+  open_file: ^4.0.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
