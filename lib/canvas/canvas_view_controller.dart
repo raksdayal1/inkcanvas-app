@@ -54,9 +54,19 @@ class CanvasViewController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// The "reset zoom" toolbar button: back to 100%, without moving
+  /// where you're looking. Uses the same "zoom under a fixed point"
+  /// mechanics [zoomIn]/[zoomOut] already rely on via
+  /// [CanvasViewport.zoomTo] - just with an absolute target scale (1.0)
+  /// instead of a relative one - anchored on whatever canvas point is
+  /// currently centered on screen. Deliberately does NOT jump back to
+  /// the page's top-left origin the way [reportSize]'s one-time initial
+  /// centering does: that made sense for opening a page you haven't
+  /// looked at yet, but doing the same thing here threw away wherever
+  /// you'd panned to, which is exactly the part of "reset zoom" that
+  /// wasn't wanted.
   void resetZoom() {
-    viewport.scale = 1.0;
-    viewport.pan = const Offset(CanvasViewport.originMargin, CanvasViewport.originMargin);
+    viewport.zoomTo(1.0, _screenCenter);
     notifyListeners();
   }
 }

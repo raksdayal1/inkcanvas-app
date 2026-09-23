@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
@@ -7,6 +8,7 @@ import '../models/canvas_element.dart';
 import '../models/notebook.dart';
 import '../models/page.dart';
 import '../models/section.dart';
+import '../storage/library_backup_codec.dart';
 import '../storage/local_store.dart';
 import '../storage/page_change_set.dart';
 import '../sync/device_identity.dart';
@@ -37,6 +39,18 @@ class NotYourNotebookException implements Exception {
   final String notebookId;
   @override
   String toString() => 'Only the device that owns notebook $notebookId can delete it.';
+}
+
+/// What [LibraryController.importBackup] hands back - a short summary
+/// the UI shows the user (see home_screen.dart's Import action)
+/// instead of just silently succeeding, since "how many of my
+/// notebooks actually came back" is exactly what someone restoring
+/// from a backup wants to know.
+class ImportBackupResult {
+  ImportBackupResult({required this.imported, required this.alreadyPresent, required this.skippedDeleted});
+  final int imported;
+  final int alreadyPresent;
+  final int skippedDeleted;
 }
 
 /// Owns the whole library (all notebooks) plus which notebook/section/page
@@ -135,6 +149,26 @@ class LibraryController extends ChangeNotifier {
   String? selectedNotebookId;
   String? selectedSectionId;
   String? selectedPageId;
+
+  /// Which section/page were last open in a given notebook, keyed by
+  /// notebook id - snapshotted by [_rememberCurrentPosition] right
+  /// before the current notebook selection changes (see [openNotebook]/
+  /// [goHome]), and restored by [openNotebook] so switching to another
+  /// notebook and back returns you to where you left off instead of
+  /// always resetting to that notebook's first section/page. In-memory
+  /// only - doesn't survive an app restart, just switching around
+  /// within one session.
+  final Map<String, String> _lastSectionIdByNotebook = {};
+  final Map<String, String> _lastPageIdByNotebook = {};
+
+  void _rememberCurrentPosition() {
+    final notebookId = selectedNotebookId;
+    if (notebookId == null) return;
+    final sectionId = selectedSectionId;
+    final pageId = selectedPageId;
+    if (sectionId != null) _lastSectionIdByNotebook[notebookId] = sectionId;
+    if (pageId != null) _lastPageIdByNotebook[notebookId] = pageId;
+  }
 
   Future<void> load() async {
     final data = await _store.loadLibrary();
@@ -574,15 +608,28 @@ class LibraryController extends ChangeNotifier {
   // --- Navigation ------------------------------------------------------
 
   void openNotebook(String notebookId) {
+    _rememberCurrentPosition();
     selectedNotebookId = notebookId;
     final notebook = selectedNotebook;
-    selectedSectionId = notebook != null && notebook.sections.isNotEmpty
-        ? notebook.sections.first.id
-        : null;
+    // Prefer wherever this notebook was last left, but only if that
+    // section/page still actually exists (it may have been deleted
+    // locally, or by a sync tombstone, while we were away) - otherwise
+    // fall back to the old default of just opening the first one.
+    final rememberedSectionId = _lastSectionIdByNotebook[notebookId];
+    final rememberedSectionStillExists = notebook != null &&
+        rememberedSectionId != null &&
+        notebook.sections.any((s) => s.id == rememberedSectionId);
+    selectedSectionId = rememberedSectionStillExists
+        ? rememberedSectionId
+        : (notebook != null && notebook.sections.isNotEmpty ? notebook.sections.first.id : null);
     final section = selectedSection;
-    selectedPageId = section != null && section.pages.isNotEmpty
-        ? section.pages.first.id
-        : null;
+    final rememberedPageId = _lastPageIdByNotebook[notebookId];
+    final rememberedPageStillExists = section != null &&
+        rememberedPageId != null &&
+        section.pages.any((p) => p.id == rememberedPageId);
+    selectedPageId = rememberedPageStillExists
+        ? rememberedPageId
+        : (section != null && section.pages.isNotEmpty ? section.pages.first.id : null);
     notifyListeners();
   }
 
@@ -601,6 +648,7 @@ class LibraryController extends ChangeNotifier {
   }
 
   void goHome() {
+    _rememberCurrentPosition();
     selectedNotebookId = null;
     selectedSectionId = null;
     selectedPageId = null;
@@ -694,6 +742,20 @@ class LibraryController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Changes a section's color tab - same "editable" gating as
+  /// [renameSection], just a different field. Used both right after
+  /// creating a section (see notebook_screen.dart's _createSection,
+  /// which now prompts for a color instead of always auto-assigning
+  /// the next one in rotation) and later from its Rename/Delete menu's
+  /// new "Change color" entry.
+  Future<void> changeSectionColor(String notebookId, String sectionId, Color color) async {
+    _assertEditable(notebookId);
+    _findSection(notebookId, sectionId).color = color;
+    selectedNotebookOrThrow(notebookId).touch();
+    await _persist(notebookId: notebookId);
+    notifyListeners();
+  }
+
   Future<NotePage> createPage(String notebookId, String sectionId, String title) async {
     _assertEditable(notebookId);
     final section = _findSection(notebookId, sectionId);
@@ -774,6 +836,84 @@ class LibraryController extends ChangeNotifier {
     // rebuilding the whole navigation tree on every pen movement would be
     // wasteful. Screens that show "last modified" should listen to the
     // canvas controller instead, or this can be revisited later.
+  }
+
+  // --- Library backup (export/import) ---------------------------------
+
+  /// Serializes the whole library - every notebook, section, page, and
+  /// every image any of them reference - into one portable file's
+  /// bytes (see library_backup_codec.dart for the format). Doesn't
+  /// write anything to disk itself; home_screen.dart's Export action
+  /// decides where the caller actually saves the result. Meant as a
+  /// safety net independent of this device's own on-disk storage - a
+  /// reinstall (forced by a signing-key mismatch, or a deliberate
+  /// clean install) wipes that storage entirely, backup file format
+  /// notwithstanding.
+  Future<Uint8List> exportBackupBytes() async {
+    final images = await _store.collectReferencedImageBytes(notebooks);
+    return encodeLibraryBackup(notebooks: notebooks, deletedNotebookIds: deletedNotebookIds, images: images);
+  }
+
+  /// Restores notebooks from a previously-exported backup (see
+  /// [exportBackupBytes]). Additive and non-destructive, never a wipe-
+  /// and-replace: a notebook already present locally (matched by id) is
+  /// left completely untouched, and one that's in this device's own
+  /// [deletedNotebookIds] tombstone list is skipped outright - resurrecting
+  /// it would just recreate, by hand, the exact "deleted notebook comes
+  /// back" bug that android:allowBackup="false" (see AndroidManifest.xml)
+  /// was added to prevent from happening via a stale system backup
+  /// snapshot instead.
+  ///
+  /// Every imported notebook has its ownership reassigned to *this*
+  /// device's current identity, whatever the backup file says. That's
+  /// deliberate: a backup is exported from, and imported back onto,
+  /// your own device, but a reinstall also hands out a brand new
+  /// [DeviceIdentity.id] and wipes the trusted-peers list (see
+  /// DeviceIdentity/PairingStore) - so without this, [canEdit] would
+  /// see the restored notebook's old ownerDeviceId, find no live
+  /// connection to a device that no longer exists, and leave every
+  /// restored notebook permanently read-only.
+  Future<ImportBackupResult> importBackup(Uint8List bytes) async {
+    final contents = decodeLibraryBackup(bytes);
+    final imagesDir = await _store.imagesDirectory();
+    for (final entry in contents.images.entries) {
+      await _store.restoreImageBytes(entry.key, entry.value);
+    }
+
+    var imported = 0;
+    var alreadyPresent = 0;
+    var skippedDeleted = 0;
+    final existingIds = notebooks.map((n) => n.id).toSet();
+    for (final notebook in contents.notebooks) {
+      if (deletedNotebookIds.containsKey(notebook.id)) {
+        skippedDeleted++;
+        continue;
+      }
+      if (existingIds.contains(notebook.id)) {
+        alreadyPresent++;
+        continue;
+      }
+      notebook.ownerDeviceId = identity.id;
+      notebook.ownerDeviceName = identity.name;
+      for (final section in notebook.sections) {
+        for (final page in section.pages) {
+          for (final el in page.elements) {
+            if (el is ImageElement) {
+              final basename = el.filePath.substring(el.filePath.lastIndexOf('/') + 1);
+              el.filePath = '${imagesDir.path}/$basename';
+            }
+          }
+        }
+      }
+      notebooks.add(notebook);
+      imported++;
+    }
+
+    if (imported > 0) {
+      await _store.saveLibrary(notebooks, deletedNotebookIds);
+      notifyListeners();
+    }
+    return ImportBackupResult(imported: imported, alreadyPresent: alreadyPresent, skippedDeleted: skippedDeleted);
   }
 
   /// Wipes all local data (notebooks, images, this device's identity,

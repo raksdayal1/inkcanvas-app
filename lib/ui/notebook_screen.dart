@@ -10,6 +10,7 @@ import '../models/section.dart';
 import '../state/library_controller.dart';
 import '../sync/sync_engine.dart';
 import 'page_screen.dart';
+import 'widgets/notebook_dialogs.dart';
 
 /// OneNote-style layout: a colored section rail, a page list for the
 /// selected section, and the canvas for the selected page. On narrow
@@ -36,7 +37,7 @@ class NotebookScreen extends StatelessWidget {
           return Scaffold(
             body: Row(
               children: [
-                SizedBox(width: 56, child: _SectionRail(notebook: notebook, library: library, readOnly: readOnly)),
+                SizedBox(width: 200, child: _SectionRail(notebook: notebook, library: library, readOnly: readOnly)),
                 SizedBox(width: 220, child: _PageList(notebook: notebook, library: library, readOnly: readOnly)),
                 const VerticalDivider(width: 1),
                 Expanded(child: _CanvasArea(notebook: notebook, library: library)),
@@ -51,10 +52,18 @@ class NotebookScreen extends StatelessWidget {
         // drawer control via Builder and hand it down so PageScreen's app
         // bar can open it with a normal hamburger button.
         return Scaffold(
+          // Explicit width: Flutter's default Drawer width (~304dp) was
+          // fine back when the rail was a narrow 56dp icon-only column,
+          // but now that it needs real room for notebook/section names
+          // (see _SectionRail), the default left almost nothing for the
+          // page list beside it - its header text and page titles were
+          // getting squeezed down to nothing. Wide enough for the rail's
+          // 200 plus a page list that can still show a full page title.
           drawer: Drawer(
+            width: 440,
             child: Row(
               children: [
-                SizedBox(width: 56, child: _SectionRail(notebook: notebook, library: library, readOnly: readOnly)),
+                SizedBox(width: 200, child: _SectionRail(notebook: notebook, library: library, readOnly: readOnly)),
                 Expanded(child: _PageList(notebook: notebook, library: library, readOnly: readOnly)),
               ],
             ),
@@ -72,7 +81,7 @@ class NotebookScreen extends StatelessWidget {
   }
 }
 
-class _SectionRail extends StatelessWidget {
+class _SectionRail extends StatefulWidget {
   const _SectionRail({required this.notebook, required this.library, required this.readOnly});
 
   final Notebook notebook;
@@ -80,43 +89,86 @@ class _SectionRail extends StatelessWidget {
   final bool readOnly;
 
   @override
+  State<_SectionRail> createState() => _SectionRailState();
+}
+
+class _SectionRailState extends State<_SectionRail> {
+  // Which notebooks currently show their sections - OneNote-style, more
+  // than one notebook can be expanded at once. The currently open
+  // notebook starts expanded so its sections are visible right away.
+  // Session-only: resets if NotebookScreen itself gets torn down and
+  // rebuilt (e.g. going Home and back in), which is a reasonable
+  // default rather than something worth persisting to disk.
+  final Set<String> _expandedNotebookIds = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _expandedNotebookIds.add(widget.notebook.id);
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final library = widget.library;
     return Container(
       color: Theme.of(context).colorScheme.surfaceContainerHighest,
-      // SafeArea so the "New section" button at the bottom isn't hidden
-      // behind Android's system nav bar - the same class of overlap the
-      // canvas's zoom controls had before.
       child: SafeArea(
         child: Column(
           children: [
-            IconButton(
-              icon: const Icon(Icons.home),
-              iconSize: 28,
-              tooltip: 'All notebooks',
-              onPressed: library.goHome,
+            ListTile(
+              dense: true,
+              leading: const Icon(Icons.home),
+              title: const Text('All notebooks'),
+              onTap: library.goHome,
             ),
             const Divider(height: 1),
             Expanded(
               child: ListView.builder(
-                itemCount: notebook.sections.length,
+                itemCount: library.notebooks.length,
                 itemBuilder: (context, index) {
-                  final section = notebook.sections[index];
-                  final selected = section.id == library.selectedSectionId;
-                  return _SectionTab(
-                    section: section,
-                    readOnly: readOnly,
-                    selected: selected,
-                    onTap: () => library.openSection(section.id),
-                    onRename: () => _renameSection(context, section),
-                    onDelete: () => library.deleteSection(notebook.id, section.id),
+                  final nb = library.notebooks[index];
+                  final isOpen = nb.id == widget.notebook.id;
+                  final expanded = _expandedNotebookIds.contains(nb.id);
+                  final nbReadOnly = !library.canEdit(nb.id);
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _NotebookRow(
+                        notebook: nb,
+                        isOpen: isOpen,
+                        expanded: expanded,
+                        canRename: !nbReadOnly,
+                        canDelete: library.canDeleteNotebook(nb.id),
+                        onToggleExpand: () => setState(() {
+                          if (!_expandedNotebookIds.add(nb.id)) _expandedNotebookIds.remove(nb.id);
+                        }),
+                        onOpen: () {
+                          if (!isOpen) library.openNotebook(nb.id);
+                          setState(() => _expandedNotebookIds.add(nb.id));
+                        },
+                        onRename: () => renameNotebookFlow(context, library, nb),
+                        onDelete: () => deleteNotebookFlow(context, library, nb),
+                      ),
+                      if (expanded)
+                        for (final section in nb.sections)
+                          _SectionRow(
+                            section: section,
+                            selected: isOpen && section.id == library.selectedSectionId,
+                            readOnly: nbReadOnly,
+                            onTap: () {
+                              if (!isOpen) library.openNotebook(nb.id);
+                              library.openSection(section.id);
+                            },
+                            onRename: () => _renameSection(context, library, nb, section),
+                            onChangeColor: () => _changeSectionColor(context, library, nb, section),
+                            onDelete: () => library.deleteSection(nb.id, section.id),
+                          ),
+                      if (expanded && !nbReadOnly) _AddSectionRow(onTap: () => _createSection(context, library, nb)),
+                    ],
                   );
                 },
               ),
-            ),
-            IconButton(
-              icon: const Icon(Icons.add),
-              tooltip: readOnly ? 'Read-only — connect to edit' : 'New section',
-              onPressed: readOnly ? null : () => _createSection(context),
             ),
           ],
         ),
@@ -124,30 +176,142 @@ class _SectionRail extends StatelessWidget {
     );
   }
 
-  Future<void> _createSection(BuildContext context) async {
-    final title = await _promptForText(context, title: 'New section', initial: 'Section ${notebook.sections.length + 1}');
-    if (title != null && title.isNotEmpty) {
-      final color = AppTheme.notebookColors[notebook.sections.length % AppTheme.notebookColors.length];
-      final section = await library.createSection(notebook.id, title, color);
-      library.openSection(section.id);
+  Future<void> _createSection(BuildContext context, LibraryController library, Notebook nb) async {
+    final title = await promptForText(context, title: 'New section', initial: 'Section ${nb.sections.length + 1}');
+    if (title == null || title.isEmpty) return;
+    final defaultColor = AppTheme.notebookColors[nb.sections.length % AppTheme.notebookColors.length];
+    if (!context.mounted) return;
+    final color = await promptForColor(context, title: 'Section color', initial: defaultColor) ?? defaultColor;
+    final section = await library.createSection(nb.id, title, color);
+    if (nb.id != widget.notebook.id) library.openNotebook(nb.id);
+    library.openSection(section.id);
+  }
+
+  Future<void> _changeSectionColor(
+    BuildContext context,
+    LibraryController library,
+    Notebook nb,
+    NoteSection section,
+  ) async {
+    final color = await promptForColor(context, title: 'Section color', initial: section.color);
+    if (color != null) {
+      await library.changeSectionColor(nb.id, section.id, color);
     }
   }
 
-  Future<void> _renameSection(BuildContext context, NoteSection section) async {
-    final title = await _promptForText(context, title: 'Rename section', initial: section.title);
+  Future<void> _renameSection(
+    BuildContext context,
+    LibraryController library,
+    Notebook nb,
+    NoteSection section,
+  ) async {
+    final title = await promptForText(context, title: 'Rename section', initial: section.title);
     if (title != null && title.isNotEmpty) {
-      await library.renameSection(notebook.id, section.id, title);
+      await library.renameSection(nb.id, section.id, title);
     }
   }
 }
 
-class _SectionTab extends StatelessWidget {
-  const _SectionTab({
+/// One notebook's header row in the rail: its name (not just a colored
+/// icon, unlike the old icon-only rail) plus a chevron to expand/collapse
+/// its sections without switching to it, and long-press/right-click for
+/// Rename/Delete - matches OneNote desktop's look of a notebook list
+/// with each one's sections nested directly underneath it.
+class _NotebookRow extends StatelessWidget {
+  const _NotebookRow({
+    required this.notebook,
+    required this.isOpen,
+    required this.expanded,
+    required this.canRename,
+    required this.canDelete,
+    required this.onToggleExpand,
+    required this.onOpen,
+    required this.onRename,
+    required this.onDelete,
+  });
+
+  final Notebook notebook;
+  final bool isOpen;
+  final bool expanded;
+  final bool canRename;
+  final bool canDelete;
+  final VoidCallback onToggleExpand;
+  final VoidCallback onOpen;
+  final VoidCallback onRename;
+  final VoidCallback onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onOpen,
+      onLongPress: () => _showMenu(context, _globalCenterOf(context)),
+      onSecondaryTapDown: (details) => _showMenu(context, details.globalPosition),
+      child: Container(
+        color: isOpen ? Theme.of(context).colorScheme.surfaceContainerHigh : null,
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+        child: Row(
+          children: [
+            IconButton(
+              icon: Icon(expanded ? Icons.expand_more : Icons.chevron_right, size: 20),
+              tooltip: expanded ? 'Collapse' : 'Expand',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              onPressed: onToggleExpand,
+            ),
+            Container(
+              width: 22,
+              height: 22,
+              decoration: BoxDecoration(color: notebook.color, borderRadius: BorderRadius.circular(4)),
+              child: const Icon(Icons.book, color: Colors.white, size: 14),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                notebook.title,
+                style: const TextStyle(fontWeight: FontWeight.bold),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Offset _globalCenterOf(BuildContext context) {
+    final renderBox = context.findRenderObject() as RenderBox;
+    return renderBox.localToGlobal(renderBox.size.center(Offset.zero));
+  }
+
+  void _showMenu(BuildContext context, Offset globalPosition) {
+    showMenu(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromPoints(globalPosition, globalPosition),
+        Offset.zero & MediaQuery.sizeOf(context),
+      ),
+      items: [
+        if (canRename) PopupMenuItem(onTap: onRename, child: const Text('Rename')),
+        if (canDelete) PopupMenuItem(onTap: onDelete, child: const Text('Delete')),
+        if (!canRename && !canDelete)
+          const PopupMenuItem(enabled: false, child: Text('Read-only — connect to edit')),
+      ],
+    );
+  }
+}
+
+/// One section row, nested under its notebook's [_NotebookRow] - shown
+/// with its name (not just a colored folder icon, unlike the old rail)
+/// and indented to read as belonging to the notebook above it.
+class _SectionRow extends StatelessWidget {
+  const _SectionRow({
     required this.section,
     required this.selected,
     required this.readOnly,
     required this.onTap,
     required this.onRename,
+    required this.onChangeColor,
     required this.onDelete,
   });
 
@@ -156,28 +320,32 @@ class _SectionTab extends StatelessWidget {
   final bool readOnly;
   final VoidCallback onTap;
   final VoidCallback onRename;
+  final VoidCallback onChangeColor;
   final VoidCallback onDelete;
 
   @override
   Widget build(BuildContext context) {
     return InkWell(
       onTap: onTap,
-      // Anchored at the actual press/click point (not a hardcoded guess -
-      // that used to put the menu in the top-right corner regardless of
-      // where the section tab actually was on screen) so it shows up
-      // right by the folder icon you pressed. InkWell's onLongPress
-      // doesn't hand us a position (unlike onSecondaryTapDown), so for
-      // that one we anchor on the tab's own on-screen position instead.
       onLongPress: () => _showMenu(context, _globalCenterOf(context)),
       onSecondaryTapDown: (details) => _showMenu(context, details.globalPosition),
       child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 2, horizontal: 6),
-        padding: const EdgeInsets.symmetric(vertical: 10),
-        decoration: BoxDecoration(
-          color: selected ? section.color : section.color.withValues(alpha: 0.35),
-          borderRadius: BorderRadius.circular(8),
+        color: selected ? Theme.of(context).colorScheme.secondaryContainer : null,
+        padding: const EdgeInsets.only(left: 44, right: 8, top: 6, bottom: 6),
+        child: Row(
+          children: [
+            Container(width: 4, height: 16, color: section.color),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                section.title,
+                style: TextStyle(fontWeight: selected ? FontWeight.bold : FontWeight.normal),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
         ),
-        child: const Icon(Icons.folder, color: Colors.white, size: 20),
       ),
     );
   }
@@ -196,9 +364,37 @@ class _SectionTab extends StatelessWidget {
       ),
       items: [
         if (!readOnly) PopupMenuItem(onTap: onRename, child: const Text('Rename')),
+        if (!readOnly) PopupMenuItem(onTap: onChangeColor, child: const Text('Change color')),
         if (!readOnly) PopupMenuItem(onTap: onDelete, child: const Text('Delete')),
         if (readOnly) const PopupMenuItem(enabled: false, child: Text('Read-only — connect to edit')),
       ],
+    );
+  }
+}
+
+/// The "+ New Section" link at the bottom of an expanded notebook's own
+/// section list - matches OneNote's inline per-notebook add-section
+/// affordance, replacing the old rail's single add button that only
+/// ever worked on whichever notebook happened to be open.
+class _AddSectionRow extends StatelessWidget {
+  const _AddSectionRow({required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.only(left: 44, right: 8, top: 6, bottom: 10),
+        child: Row(
+          children: [
+            Icon(Icons.add, size: 16, color: Theme.of(context).colorScheme.primary),
+            const SizedBox(width: 6),
+            Text('New Section', style: TextStyle(color: Theme.of(context).colorScheme.primary)),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -331,7 +527,7 @@ class _PageList extends StatelessWidget {
     final section = library.selectedSection;
     if (section == null) return;
     if (action == 'rename') {
-      final newTitle = await _promptForText(context, title: 'Rename page', initial: title);
+      final newTitle = await promptForText(context, title: 'Rename page', initial: title);
       if (newTitle != null && newTitle.isNotEmpty) {
         await library.renamePage(notebook.id, section.id, pageId, newTitle);
       }
@@ -365,17 +561,3 @@ class _CanvasArea extends StatelessWidget {
   }
 }
 
-Future<String?> _promptForText(BuildContext context, {required String title, required String initial}) {
-  final controller = TextEditingController(text: initial);
-  return showDialog<String>(
-    context: context,
-    builder: (context) => AlertDialog(
-      title: Text(title),
-      content: TextField(controller: controller, autofocus: true),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
-        FilledButton(onPressed: () => Navigator.pop(context, controller.text.trim()), child: const Text('OK')),
-      ],
-    ),
-  );
-}
